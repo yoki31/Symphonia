@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -14,9 +14,9 @@ use symphonia_core::io::ReadBitsLtr;
 use lazy_static::lazy_static;
 use log::info;
 
-use crate::common::*;
-use crate::codebooks;
 use super::GranuleChannel;
+use crate::codebooks;
+use crate::common::*;
 
 lazy_static! {
     /// Lookup table for computing x(i) = s(i)^(4/3) where s(i) is a decoded Huffman sample. The
@@ -34,6 +34,14 @@ lazy_static! {
     };
 }
 
+/// Zero a sample buffer.
+#[inline(always)]
+pub(super) fn zero(buf: &mut [f32; 576]) {
+    for s in buf.iter_mut() {
+        *s = 0.0;
+    }
+}
+
 /// Reads the Huffman coded spectral samples for a given channel in a granule from a `BitStream`
 /// into a provided sample buffer. Returns the number of decoded samples (the starting index of the
 /// rzero partition).
@@ -47,12 +55,9 @@ pub(super) fn read_huffman_samples<B: ReadBitsLtr>(
     part3_bits: u32,
     buf: &mut [f32; 576],
 ) -> Result<usize> {
-
     // If there are no Huffman code bits, zero all samples and return immediately.
     if part3_bits == 0 {
-        for sample in buf.iter_mut() {
-            *sample = 0.0;
-        }
+        zero(buf);
         return Ok(0);
     }
 
@@ -72,7 +77,7 @@ pub(super) fn read_huffman_samples<B: ReadBitsLtr>(
     let regions: [usize; 3] = [
         min(channel.region1_start as usize, big_values_len),
         min(channel.region2_start as usize, big_values_len),
-        min(                           576, big_values_len),
+        min(576, big_values_len),
     ];
 
     // Iterate over each region in big_values.
@@ -83,7 +88,7 @@ pub(super) fn read_huffman_samples<B: ReadBitsLtr>(
         // Tables 0..16 are all unique, while tables 16..24 and 24..32 each use one table but
         // differ in the number of linbits to use.
         let codebook = match table_select {
-            0..=15  => &codebooks::CODEBOOK_TABLES[table_select],
+            0..=15 => &codebooks::CODEBOOK_TABLES[table_select],
             16..=23 => &codebooks::CODEBOOK_TABLES[16],
             24..=31 => &codebooks::CODEBOOK_TABLES[17],
             _ => unreachable!(),
@@ -213,18 +218,24 @@ pub(super) fn read_huffman_samples<B: ReadBitsLtr>(
     }
     // Word on the street is that some encoders are poor at "stuffing" bits, resulting in part3_len
     // being ever so slightly too large. This causes the Huffman decode loop to decode the next few
-    // bits as a sample. However, these bits are random data and not a real sample, so erase it!
-    // The caller will be reponsible for re-aligning the bitstream reader. Candy Pop confirms this.
-    else if bits_read > part3_bits {
+    // bits as spectral samples. However, these bits are actually random data and are not real
+    // samples, therefore, undo them! The caller will be reponsible for re-aligning the bitstream
+    // reader. Candy Pop confirms this.
+    else if bits_read > part3_bits && i > big_values_len {
         info!("count1 overrun, malformed bitstream");
         i -= 4;
+    }
+    else if bits_read > part3_bits {
+        // It seems that most other decoders don't undo overruns of the big values. We'll just print
+        // a message for now.
+        info!("big_values overrun, malformed bitstream");
     }
 
     // The final partition after the count1 partition is the rzero partition. Samples in this
     // partition are all 0.
     for j in (i..576).step_by(2) {
-        buf[j+0] = 0.0;
-        buf[j+1] = 0.0;
+        buf[j + 0] = 0.0;
+        buf[j + 1] = 0.0;
     }
 
     Ok(i)
@@ -246,10 +257,8 @@ fn requantize_long(channel: &GranuleChannel, bands: &[usize], buf: &mut [f32; 57
     debug_assert!(bands.len() <= 23);
 
     // The preemphasis table is from table B.6 in ISO/IEC 11172-3.
-    const PRE_EMPHASIS: [u8; 22] = [
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        1, 1, 1, 1, 2, 2, 3, 3, 3, 2, 0,
-    ];
+    const PRE_EMPHASIS: [u8; 22] =
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 3, 2, 0];
 
     // Calculate A, it is constant for the entire requantization.
     let a = i32::from(channel.global_gain) - 210;
@@ -326,7 +335,7 @@ fn requantize_short(
     for (i, (start, end)) in bands.iter().zip(&bands[1..]).enumerate() {
         // Do not requantize bands starting after the rzero sample since all samples from there on
         // are 0.
-        if *start > channel.rzero {
+        if *start >= channel.rzero {
             break;
         }
 
@@ -336,7 +345,7 @@ fn requantize_short(
         // Calculate 2^(0.25*A) * 2^(-B). This can be rewritten as 2^{ 0.25 * (A - 4 * B) }.
         // Since scalefac_shift multiplies by 4 above, the final equation becomes
         // 2^{ 0.25 * (A - B) }.
-        let pow2ab = f64::powf(2.0,  0.25 * f64::from(a[i % 3] - b)) as f32;
+        let pow2ab = f64::powf(2.0, 0.25 * f64::from(a[i % 3] - b)) as f32;
 
         // Clamp the ending sample index to the rzero sample index. Since samples starting from
         // rzero are 0, there is no point in requantizing them.
@@ -348,19 +357,14 @@ fn requantize_short(
             *sample *= pow2ab;
         }
     }
-
 }
 
 /// Requantize samples in `buf` regardless of block type.
-pub(super) fn requantize(
-    header: &FrameHeader,
-    channel: &GranuleChannel,
-    buf: &mut [f32; 576],
-) {
+pub(super) fn requantize(header: &FrameHeader, channel: &GranuleChannel, buf: &mut [f32; 576]) {
     match channel.block_type {
         BlockType::Short { is_mixed: false } => {
             requantize_short(channel, &SFB_SHORT_BANDS[header.sample_rate_idx], 0, buf);
-        },
+        }
         BlockType::Short { is_mixed: true } => {
             // A mixed block is a combination of a long block and short blocks. The first few scale
             // factor bands, and thus samples, belong to a single long block, while the remaining
@@ -374,9 +378,9 @@ pub(super) fn requantize(
 
             requantize_long(channel, &bands[..switch], buf);
             requantize_short(channel, &bands[switch..], switch, buf);
-        },
+        }
         _ => {
             requantize_long(channel, &SFB_LONG_BANDS[header.sample_rate_idx], buf);
-        },
+        }
     }
 }

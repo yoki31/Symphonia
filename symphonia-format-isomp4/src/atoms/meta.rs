@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -9,7 +9,7 @@ use std::fmt::Debug;
 
 use symphonia_core::errors::Result;
 use symphonia_core::io::ReadBytes;
-use symphonia_core::meta::{MetadataRevision, MetadataLog};
+use symphonia_core::meta::MetadataRevision;
 
 use crate::atoms::{Atom, AtomHeader, AtomIterator, AtomType, IlstAtom};
 
@@ -18,7 +18,7 @@ pub struct MetaAtom {
     /// Atom header.
     header: AtomHeader,
     /// Metadata revision.
-    pub metadata: MetadataRevision,
+    pub metadata: Option<MetadataRevision>,
 }
 
 impl Debug for MetaAtom {
@@ -28,9 +28,9 @@ impl Debug for MetaAtom {
 }
 
 impl MetaAtom {
-    /// Consumes the metadata, and pushes it onto provided `MetadataLog`.
-    pub fn take_metadata(self, log: &mut MetadataLog) {
-        log.push(self.metadata)
+    /// If metadata was read, consumes the metadata and returns it.
+    pub fn take_metadata(&mut self) -> Option<MetadataRevision> {
+        self.metadata.take()
     }
 }
 
@@ -56,13 +56,10 @@ impl Atom for MetaAtom {
                 AtomType::MetaList => {
                     metadata = Some(iter.read_atom::<IlstAtom>()?.metadata);
                 }
-                _ => ()
+                _ => (),
             }
         }
 
-        Ok(MetaAtom {
-            header,
-            metadata: metadata.unwrap(),
-        })
+        Ok(MetaAtom { header, metadata })
     }
 }

@@ -1,11 +1,13 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The `units` module provides definitions for common units.
+
+use std::fmt;
 
 /// A `TimeStamp` represents an instantenous instant in time since the start of a stream. One
 /// `TimeStamp` "tick" is equivalent to the stream's `TimeBase` in seconds.
@@ -17,7 +19,7 @@ pub type Duration = u64;
 /// `Time` represents a duration of time in seconds, or the number of seconds since an arbitrary
 /// epoch. `Time` is stored as an integer number of seconds plus any remaining fraction of a second
 /// as a floating point value.
-#[derive(Debug, Default, Copy, Clone, PartialEq, PartialOrd)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, PartialOrd)]
 pub struct Time {
     pub seconds: u64,
     pub frac: f64,
@@ -61,8 +63,8 @@ impl Time {
         }
 
         let seconds = (Time::SECONDS_PER_HOUR * u64::from(h))
-                            + (Time::SECONDS_PER_MINUTE * u64::from(m))
-                            + u64::from(s);
+            + (Time::SECONDS_PER_MINUTE * u64::from(m))
+            + u64::from(s);
 
         let frac = Time::NANOSECONDS_PER_SECOND_INV * f64::from(ns);
 
@@ -71,19 +73,27 @@ impl Time {
 }
 
 impl From<u8> for Time {
-    fn from(seconds: u8) -> Self { Time::new(u64::from(seconds), 0.0) }
+    fn from(seconds: u8) -> Self {
+        Time::new(u64::from(seconds), 0.0)
+    }
 }
 
 impl From<u16> for Time {
-    fn from(seconds: u16) -> Self { Time::new(u64::from(seconds), 0.0) }
+    fn from(seconds: u16) -> Self {
+        Time::new(u64::from(seconds), 0.0)
+    }
 }
 
 impl From<u32> for Time {
-    fn from(seconds: u32) -> Self { Time::new(u64::from(seconds), 0.0) }
+    fn from(seconds: u32) -> Self {
+        Time::new(u64::from(seconds), 0.0)
+    }
 }
 
 impl From<u64> for Time {
-    fn from(seconds: u64) -> Self { Time::new(seconds, 0.0) }
+    fn from(seconds: u64) -> Self {
+        Time::new(seconds, 0.0)
+    }
 }
 
 impl From<f32> for Time {
@@ -108,8 +118,12 @@ impl From<f64> for Time {
     }
 }
 
-#[derive(Debug, Default, Copy, Clone, PartialEq)]
-/// A `TimeBase` is the conversion factor between a `TimeStamp` and real-world seconds.
+/// A `TimeBase` is the conversion factor between time, expressed in seconds, and a `TimeStamp` or
+/// `Duration`.
+///
+/// In other words, a `TimeBase` is the length in seconds of one tick of a `TimeStamp` or
+/// `Duration`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, PartialOrd)]
 pub struct TimeBase {
     /// The numerator.
     pub numer: u32,
@@ -120,7 +134,7 @@ pub struct TimeBase {
 impl TimeBase {
     /// Creates a new `TimeBase`. Panics if either the numerator or denominator is 0.
     pub fn new(numer: u32, denom: u32) -> Self {
-        if numer == 0 || denom == 0{
+        if numer == 0 || denom == 0 {
             panic!("TimeBase cannot have 0 numerator or denominator");
         }
 
@@ -183,7 +197,7 @@ impl TimeBase {
         let a = if product > (1 << 52) {
             // Split the 96-bit product into 48-bit halves.
             let u = ((product & !0xffff_ffff_ffff) >> 48) as u64;
-            let l = ((product &  0xffff_ffff_ffff) >>  0) as u64;
+            let l = ((product & 0xffff_ffff_ffff) >> 0) as u64;
 
             let uk = (u as f64) * k;
             let ul = (l as f64) * k;
@@ -200,12 +214,17 @@ impl TimeBase {
 
         a.wrapping_add(b)
     }
-
 }
 
 impl From<TimeBase> for f64 {
     fn from(timebase: TimeBase) -> Self {
         f64::from(timebase.numer) / f64::from(timebase.denom)
+    }
+}
+
+impl fmt::Display for TimeBase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.numer, self.denom)
     }
 }
 
@@ -231,10 +250,14 @@ mod tests {
         // Verify accuracy of time -> timestamp
         assert_eq!(tb1.calc_timestamp(Time::new(0, 0.0)), 0);
         assert_eq!(tb1.calc_timestamp(Time::new(38, 0.578125)), 12_345);
-        assert_eq!(tb1.calc_timestamp(Time::new(14_073_748_835_532, 0.796875)), 0x0f_ffff_ffff_ffff);
-        assert_eq!(tb1.calc_timestamp(Time::new(14_073_748_835_532, 0.803125)), 0x10_0000_0000_0001);
+        assert_eq!(
+            tb1.calc_timestamp(Time::new(14_073_748_835_532, 0.796875)),
+            0x0f_ffff_ffff_ffff
+        );
+        assert_eq!(
+            tb1.calc_timestamp(Time::new(14_073_748_835_532, 0.803125)),
+            0x10_0000_0000_0001
+        );
         assert_eq!(tb1.calc_timestamp(Time::new(57_646_075_230_342_348, 0.796875)), u64::MAX);
-
     }
-
 }

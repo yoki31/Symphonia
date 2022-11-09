@@ -1,15 +1,16 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use symphonia_core::audio::{AudioBuffer, AudioBufferRef, AsAudioBufferRef, Signal};
-use symphonia_core::codecs::{CODEC_TYPE_MP3, CodecParameters, CodecDescriptor};
+use symphonia_core::audio::{AsAudioBufferRef, AudioBuffer, AudioBufferRef, Signal};
+use symphonia_core::codecs::{CodecDescriptor, CodecParameters, CODEC_TYPE_MP3};
 use symphonia_core::codecs::{Decoder, DecoderOptions, FinalizeResult};
-use symphonia_core::errors::{Result, decode_error};
+use symphonia_core::errors::{decode_error, unsupported_error, Result};
 use symphonia_core::formats::Packet;
+use symphonia_core::io::FiniteStream;
 use symphonia_core::support_codec;
 
 use super::{common::*, header, layer3};
@@ -27,13 +28,26 @@ impl Mp3Decoder {
 
         let header = header::read_frame_header(&mut reader)?;
 
-        // The buffer can only be created after the first frame is decoded. Technically, it can
-        // change throughout the stream as well...
+        // The packet should be the size stated in the header.
+        if header.frame_size != reader.bytes_available() as usize {
+            return decode_error("mp3: invalid packet length");
+        }
+
+        // The audio buffer can only be created after the first frame is decoded.
         if self.buf.is_unused() {
             self.buf = AudioBuffer::new(1152, header.spec());
         }
+        else {
+            // Ensure the packet contains an audio frame with the same signal specification as the
+            // buffer.
+            //
+            // TODO: Is it worth it to support changing signal specifications?
+            if self.buf.spec() != &header.spec() {
+                return decode_error("mp3: invalid audio buffer signal spec for packet");
+            }
+        }
 
-        // Clear the audio output buffer.
+        // Clear the audio buffer.
         self.buf.clear();
 
         // Choose the decode step based on the MPEG layer and the current codec type.
@@ -41,22 +55,24 @@ impl Mp3Decoder {
             MpegLayer::Layer3 if self.params.codec == CODEC_TYPE_MP3 => {
                 // Layer 3
                 layer3::decode_frame(&mut reader, &header, &mut self.state, &mut self.buf)?;
-            },
+            }
             _ => return decode_error("mp3: invalid mpeg audio layer"),
         }
+
+        self.buf.trim(packet.trim_start() as usize, packet.trim_end() as usize);
 
         Ok(())
     }
 }
 
 impl Decoder for Mp3Decoder {
-
     fn try_new(params: &CodecParameters, _: &DecoderOptions) -> Result<Self> {
-        Ok(Mp3Decoder {
-            params: params.clone(),
-            state: State::new(),
-            buf: AudioBuffer::unused(),
-        })
+        // This decoder only supports MP3.
+        if params.codec != CODEC_TYPE_MP3 {
+            return unsupported_error("mp3: invalid codec type");
+        }
+
+        Ok(Mp3Decoder { params: params.clone(), state: State::new(), buf: AudioBuffer::unused() })
     }
 
     fn supported_codecs() -> &'static [CodecDescriptor] {
@@ -80,7 +96,8 @@ impl Decoder for Mp3Decoder {
         if let Err(e) = self.decode_inner(packet) {
             self.buf.clear();
             Err(e)
-        } else {
+        }
+        else {
             Ok(self.buf.as_audio_buffer_ref())
         }
     }

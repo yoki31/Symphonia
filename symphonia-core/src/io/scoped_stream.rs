@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -8,13 +8,17 @@
 use std::cmp;
 use std::io;
 
-use super::{ReadBytes, FiniteStream};
+use super::{FiniteStream, ReadBytes, SeekBuffered};
 
-const OUT_OF_BOUNDS_ERROR_STR: &str = "out of bounds";
+#[inline(always)]
+fn out_of_bounds_error<T>() -> io::Result<T> {
+    Err(io::Error::new(io::ErrorKind::UnexpectedEof, "out of bounds"))
+}
 
 /// A `ScopedStream` restricts the number of bytes that may be read to an upper limit.
 pub struct ScopedStream<B: ReadBytes> {
     inner: B,
+    start: u64,
     len: u64,
     read: u64,
 }
@@ -23,19 +27,15 @@ impl<B: ReadBytes> ScopedStream<B> {
     /// Instantiates a new `ScopedStream` with an upper limit on the number of bytes that can be
     /// read from the inner source.
     pub fn new(inner: B, len: u64) -> Self {
-        ScopedStream {
-            inner,
-            len,
-            read: 0,
-        }
+        ScopedStream { start: inner.pos(), inner, len, read: 0 }
     }
 
-    /// Returns an immutable reference to the inner `ByteStream`.
+    /// Returns an immutable reference to the inner stream.
     pub fn inner(&self) -> &B {
         &self.inner
     }
 
-    /// Returns a mutable reference to the inner `ByteStream`.
+    /// Returns a mutable reference to the inner stream.
     pub fn inner_mut(&mut self) -> &mut B {
         &mut self.inner
     }
@@ -45,7 +45,7 @@ impl<B: ReadBytes> ScopedStream<B> {
         self.inner.ignore_bytes(self.len - self.read)
     }
 
-    /// Convert the `ScopedStream` to the inner `ByteStream`.
+    /// Convert the `ScopedStream` to the inner stream.
     pub fn into_inner(self) -> B {
         self.inner
     }
@@ -68,12 +68,11 @@ impl<B: ReadBytes> FiniteStream for ScopedStream<B> {
     }
 }
 
-impl<B: ReadBytes,> ReadBytes for ScopedStream<B> {
-
+impl<B: ReadBytes> ReadBytes for ScopedStream<B> {
     #[inline(always)]
     fn read_byte(&mut self) -> io::Result<u8> {
         if self.len - self.read < 1 {
-            return Err(io::Error::new(io::ErrorKind::Other, OUT_OF_BOUNDS_ERROR_STR));
+            return out_of_bounds_error();
         }
 
         self.read += 1;
@@ -83,7 +82,7 @@ impl<B: ReadBytes,> ReadBytes for ScopedStream<B> {
     #[inline(always)]
     fn read_double_bytes(&mut self) -> io::Result<[u8; 2]> {
         if self.len - self.read < 2 {
-            return Err(io::Error::new(io::ErrorKind::Other, OUT_OF_BOUNDS_ERROR_STR));
+            return out_of_bounds_error();
         }
 
         self.read += 2;
@@ -93,7 +92,7 @@ impl<B: ReadBytes,> ReadBytes for ScopedStream<B> {
     #[inline(always)]
     fn read_triple_bytes(&mut self) -> io::Result<[u8; 3]> {
         if self.len - self.read < 3 {
-            return Err(io::Error::new(io::ErrorKind::Other, OUT_OF_BOUNDS_ERROR_STR));
+            return out_of_bounds_error();
         }
 
         self.read += 3;
@@ -103,7 +102,7 @@ impl<B: ReadBytes,> ReadBytes for ScopedStream<B> {
     #[inline(always)]
     fn read_quad_bytes(&mut self) -> io::Result<[u8; 4]> {
         if self.len - self.read < 4 {
-            return Err(io::Error::new(io::ErrorKind::Other, OUT_OF_BOUNDS_ERROR_STR));
+            return out_of_bounds_error();
         }
 
         self.read += 4;
@@ -120,7 +119,7 @@ impl<B: ReadBytes,> ReadBytes for ScopedStream<B> {
 
     fn read_buf_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
         if self.len - self.read < buf.len() as u64 {
-            return Err(io::Error::new(io::ErrorKind::Other, OUT_OF_BOUNDS_ERROR_STR));
+            return out_of_bounds_error();
         }
 
         self.read += buf.len() as u64;
@@ -132,10 +131,10 @@ impl<B: ReadBytes,> ReadBytes for ScopedStream<B> {
         &mut self,
         pattern: &[u8],
         align: usize,
-        buf: &'a mut [u8]
+        buf: &'a mut [u8],
     ) -> io::Result<&'a mut [u8]> {
         if self.len - self.read < buf.len() as u64 {
-            return Err(io::Error::new(io::ErrorKind::Other, OUT_OF_BOUNDS_ERROR_STR));
+            return out_of_bounds_error();
         }
 
         let result = self.inner.scan_bytes_aligned(pattern, align, buf)?;
@@ -143,9 +142,10 @@ impl<B: ReadBytes,> ReadBytes for ScopedStream<B> {
         Ok(result)
     }
 
+    #[inline(always)]
     fn ignore_bytes(&mut self, count: u64) -> io::Result<()> {
         if self.len - self.read < count {
-            return Err(io::Error::new(io::ErrorKind::Other, OUT_OF_BOUNDS_ERROR_STR));
+            return out_of_bounds_error();
         }
 
         self.read += count;
@@ -155,5 +155,37 @@ impl<B: ReadBytes,> ReadBytes for ScopedStream<B> {
     #[inline(always)]
     fn pos(&self) -> u64 {
         self.inner.pos()
+    }
+}
+
+impl<B: ReadBytes + SeekBuffered> SeekBuffered for ScopedStream<B> {
+    #[inline(always)]
+    fn ensure_seekback_buffer(&mut self, len: usize) {
+        self.inner.ensure_seekback_buffer(len)
+    }
+
+    #[inline(always)]
+    fn unread_buffer_len(&self) -> usize {
+        self.inner.unread_buffer_len().min((self.len - self.read) as usize)
+    }
+
+    #[inline(always)]
+    fn read_buffer_len(&self) -> usize {
+        self.inner.read_buffer_len().min(self.read as usize)
+    }
+
+    #[inline(always)]
+    fn seek_buffered(&mut self, pos: u64) -> u64 {
+        // Clamp the seekable position to within the bounds of the ScopedStream.
+        self.inner.seek_buffered(pos.clamp(self.start, self.start + self.len))
+    }
+
+    #[inline(always)]
+    fn seek_buffered_rel(&mut self, delta: isize) -> u64 {
+        // Clamp the delta value such that the absolute position after the buffered seek will be
+        // within the bounds of the ScopedStream.
+        let max_back = self.read.min(std::isize::MAX as u64) as isize;
+        let max_forward = (self.len - self.read).min(std::isize::MAX as u64) as isize;
+        self.inner.seek_buffered_rel(delta.clamp(-max_back, max_forward))
     }
 }

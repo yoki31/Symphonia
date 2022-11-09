@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -9,14 +9,14 @@ use std::cmp::min;
 use std::collections::VecDeque;
 
 use symphonia_core::checksum::Crc16Ansi;
-use symphonia_core::errors::{Result, Error};
-use symphonia_core::io::{BufReader, ReadBytes, Monitor};
+use symphonia_core::errors::{Error, Result};
+use symphonia_core::io::{BufReader, Monitor, ReadBytes};
 use symphonia_core::util::bits;
 use symphonia_utils_xiph::flac::metadata::StreamInfo;
 
 use log::{error, trace, warn};
 
-use super::frame::{BlockSequence, FrameHeader, is_likely_frame_header, read_frame_header};
+use super::frame::{is_likely_frame_header, read_frame_header, BlockSequence, FrameHeader};
 
 #[inline(always)]
 fn round_pow2(value: usize, pow2: usize) -> usize {
@@ -77,8 +77,8 @@ impl PacketParser {
 
     /// The maximum buffer length possible.
     const MAX_BUF_LEN: usize = PacketParser::FLAC_MAX_FRAME_LEN
-                                + PacketParser::FLAC_MAX_FRAME_HEADER_LEN
-                                + PacketParser::BUF_PADDING;
+        + PacketParser::FLAC_MAX_FRAME_HEADER_LEN
+        + PacketParser::BUF_PADDING;
 
     // Frames:    [                           F0                          |   ..   ]
     //                                                                    :
@@ -92,20 +92,30 @@ impl PacketParser {
     // rules and heuristics are used to limit the number of fragments that can be recombined. This
     // is required to detect errors.
 
-    pub fn reset(&mut self, stream_info: StreamInfo) {
+    /// Reset the packet parser for a new stream.
+    pub fn hard_reset(&mut self, stream_info: StreamInfo) {
         self.stream_info = stream_info;
+        self.soft_reset()
+    }
+
+    /// Reset the packet parser after a stream discontinuity.
+    pub fn soft_reset(&mut self) {
         self.frame_size_hist = [PacketParser::FLAC_AVG_FRAME_LEN; 4];
         self.n_frames = 0;
         self.last_seq = 0;
         self.last_read_err = None;
+        self.buf_write = 0;
+        self.buf_read = 0;
+        self.fragments.clear();
     }
 
     fn buffer_data<B: ReadBytes>(&mut self, reader: &mut B) -> Result<()> {
         // Calculate the average frame size.
         let avg_frame_size = ((self.frame_size_hist[0]
-                                + self.frame_size_hist[1]
-                                + self.frame_size_hist[2]
-                                + self.frame_size_hist[3]) / 4) as usize;
+            + self.frame_size_hist[1]
+            + self.frame_size_hist[2]
+            + self.frame_size_hist[3])
+            / 4) as usize;
 
         // Read average frame size bytes.
         let new_buf_write = self.buf_write + round_pow2(avg_frame_size, 4096);
@@ -113,10 +123,7 @@ impl PacketParser {
         if new_buf_write >= self.buf.len() - PacketParser::BUF_PADDING {
             // Grow buffer to 1.25x the average frame size, plus padding, rounded to the nearest
             // multiple of 4kB.
-            let new_size = round_pow2(
-                ((10 * new_buf_write) / 8) + PacketParser::BUF_PADDING,
-                4096
-            );
+            let new_size = round_pow2(((10 * new_buf_write) / 8) + PacketParser::BUF_PADDING, 4096);
 
             if new_size > PacketParser::MAX_BUF_LEN {
                 error!("buffer would exceed maximum size");
@@ -175,7 +182,8 @@ impl PacketParser {
                         return Ok(());
                     }
 
-                    let buf = &self.buf[pos + i + 1..pos + i + PacketParser::FLAC_MAX_FRAME_HEADER_LEN + 1];
+                    let buf = &self.buf
+                        [pos + i + 1..pos + i + PacketParser::FLAC_MAX_FRAME_HEADER_LEN + 1];
 
                     // If the header buffer passes a quick sanity check, then attempt to parse the
                     // frame header in its entirety.
@@ -286,16 +294,16 @@ impl PacketParser {
 
         indicies[n_fragments] = match self.fragments.get(n_fragments) {
             Some(fragment) => fragment.pos,
-            None           => self.buf_write,
+            None => self.buf_write,
         };
 
         // First, second, and third represent three descending tiers of confidence. A set bit
         // indicates that the fragment at the index of the set bit is likely to be a valid
         // fragment. If absolutely no bits are set then the stream is either very corrupt,
         // malicious, or not FLAC.
-        let first  = (score_par & score_len) & score_seq;
+        let first = (score_par & score_len) & score_seq;
         let second = (score_par | score_len) & score_seq;
-        let third  = (score_par | score_len) | score_seq;
+        let third = (score_par | score_len) | score_seq;
 
         let best = match (first, second, third) {
             (0, 0, _) => third,
@@ -396,26 +404,14 @@ impl PacketParser {
                     //
                     // 1) A frame may never exceed 16MB per the specification.
                     //
-                    // 2) If there is a second-best fragment, then discard all predecessors to it
-                    //    and try again. A second-best fragment met all the same criteria as the
-                    //    best-pick fragment except that it is sequentially after the best-pick
-                    //    fragment. In other words, we have as much confidence in the second-best
-                    //    fragment being the start of a frame as we do the best-pick fragment. Thus,
-                    //    if a second-best fragment exists, it must be the exclusive upper bound of
-                    //    the frame that starting with the best-pick fragment. Therefore, if the
-                    //    best-pick fragment failed to form a complete and valid frame when it
-                    //    reaches the second-best pick fragment, the frame itself must be corrupt
-                    //    and can be discarded.
+                    // 2a) If the stream information block defines a maximum frame size, use that
+                    //     limit to bound the frame.
                     //
-                    // 3a) If there is no second-best fragment to bound the frame starting from the
-                    //     best-pick fragment, then if the stream information block defines a
-                    //     maximum frame size, use that limit to bound the frame.
-                    //
-                    // 3b) If the stream information block does not define a maximum frame size, and
+                    // 2b) If the stream information block does not define a maximum frame size, and
                     //     if average frame length moving-average filter is filled, then use 2x the
                     //     average frame size as the limit.
                     //
-                    // 3c) If the average frame length moving-average filter has not been filled,
+                    // 2c) If the average frame length moving-average filter has not been filled,
                     //     then use 4 fragments as the limit.
                     //
                     // If none of these heuristics are met, then it is reasonable to continue to
@@ -438,32 +434,24 @@ impl PacketParser {
                             warn!("rebuild failure; frame exceeds 16MB");
                             limit_hit = true;
                         }
-                        // Heuristic 2.
-                        else if best & (2 << count) != 0 {
-                            warn!(
-                                "rebuild failure; \
-                                frame exceeds lower-bound of next-best fragment"
-                            );
-                            limit_hit = true;
-                        }
-                        // Heuristic 3a.
+                        // Heuristic 2a.
                         else if self.stream_info.frame_byte_len_max > 0 {
                             if (frame_len as u32) > self.stream_info.frame_byte_len_max {
                                 warn!(
                                     "rebuild failure; \
                                     frame exceeds stream's frame length limit ({} > {})",
-                                    frame_len,
-                                    self.stream_info.frame_byte_len_max
+                                    frame_len, self.stream_info.frame_byte_len_max
                                 );
                                 limit_hit = true;
                             }
                         }
-                        // Heuristic 3b.
+                        // Heuristic 2b.
                         else if self.n_frames >= 4 {
                             let avg_frame_size = (self.frame_size_hist[0]
-                                                    + self.frame_size_hist[1]
-                                                    + self.frame_size_hist[2]
-                                                    + self.frame_size_hist[3]) / 4;
+                                + self.frame_size_hist[1]
+                                + self.frame_size_hist[2]
+                                + self.frame_size_hist[3])
+                                / 4;
 
                             if (frame_len as u32) > 2 * avg_frame_size {
                                 warn!(
@@ -473,7 +461,7 @@ impl PacketParser {
                                 limit_hit = true;
                             }
                         }
-                        // Heuristic 3c.
+                        // Heuristic 2c.
                         else if count >= 4 {
                             warn!("rebuild failure; frame exceeds fragment limit");
                             limit_hit = true;
@@ -514,5 +502,4 @@ impl PacketParser {
             }
         }
     }
-
 }

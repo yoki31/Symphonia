@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -30,17 +30,11 @@ impl Atom for WaveAtom {
         let mut esds = None;
 
         while let Some(header) = iter.next()? {
-            match header.atype {
-                AtomType::Esds => {
-                    esds = Some(iter.read_atom::<EsdsAtom>()?);
-                }
-                _ => (),
+            if header.atype == AtomType::Esds {
+                esds = Some(iter.read_atom::<EsdsAtom>()?);
             }
         }
 
-        Ok(WaveAtom {
-            header,
-            esds,
-        })
+        Ok(WaveAtom { header, esds })
     }
 }

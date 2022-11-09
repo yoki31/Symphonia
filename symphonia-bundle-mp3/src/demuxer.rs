@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -9,7 +9,7 @@ use symphonia_core::support_format;
 
 use symphonia_core::checksum::Crc16AnsiLe;
 use symphonia_core::codecs::{CodecParameters, CODEC_TYPE_MP3};
-use symphonia_core::errors::{Result, SeekErrorKind, seek_error};
+use symphonia_core::errors::{seek_error, Result, SeekErrorKind};
 use symphonia_core::formats::prelude::*;
 use symphonia_core::io::*;
 use symphonia_core::meta::{Metadata, MetadataLog};
@@ -19,17 +19,19 @@ use std::io::{Seek, SeekFrom};
 
 use log::{debug, info, warn};
 
-use super::common::{ChannelMode, FrameHeader, MpegVersion, SAMPLES_PER_GRANULE};
+use super::common::{FrameHeader, SAMPLES_PER_GRANULE};
 use super::header;
+use super::header::MPEG_HEADER_LEN;
 
-/// MPEG1 and MPEG2 audio frame reader.
+/// MPEG1 and MPEG2 audio elementary stream reader.
 ///
-/// `Mp3Reader` implements a demuxer for the MPEG1 and MPEG2 audio frame format.
+/// `Mp3Reader` implements a demuxer for the MPEG1 and MPEG2 audio elementary stream.
 pub struct Mp3Reader {
     reader: MediaSourceStream,
     tracks: Vec<Track>,
     cues: Vec<Cue>,
     metadata: MetadataLog,
+    options: FormatOptions,
     first_frame_pos: u64,
     next_packet_ts: u64,
 }
@@ -41,13 +43,17 @@ impl QueryDescriptor for Mp3Reader {
             support_format!(
                 "mp3",
                 "MPEG Audio Layer 3 Native",
-                &[ "mp3" ],
-                &[ "audio/mp3" ],
+                &["mp3"],
+                &["audio/mp3"],
                 &[
-                    &[ 0xff, 0xfa ], &[ 0xff, 0xfb ], // MPEG 1
-                    &[ 0xff, 0xf2 ], &[ 0xff, 0xf3 ], // MPEG 2
-                    &[ 0xff, 0xe2 ], &[ 0xff, 0xe3 ], // MPEG 2.5
-                ]),
+                    &[0xff, 0xfa],
+                    &[0xff, 0xfb], // MPEG 1
+                    &[0xff, 0xf2],
+                    &[0xff, 0xf3], // MPEG 2
+                    &[0xff, 0xe2],
+                    &[0xff, 0xe3], // MPEG 2.5
+                ]
+            ),
         ]
     }
 
@@ -57,38 +63,60 @@ impl QueryDescriptor for Mp3Reader {
 }
 
 impl FormatReader for Mp3Reader {
-
-    fn try_new(mut source: MediaSourceStream, _options: &FormatOptions) -> Result<Self> {
+    fn try_new(mut source: MediaSourceStream, options: &FormatOptions) -> Result<Self> {
         // Try to read the first MPEG frame.
-        let (header, packet) = read_mpeg_frame(&mut source)?;
+        let (header, packet) = read_mpeg_frame_strict(&mut source)?;
 
         // Use the header to populate the codec parameters.
         let mut params = CodecParameters::new();
 
-        params.for_codec(CODEC_TYPE_MP3)
-              .with_sample_rate(header.sample_rate)
-              .with_time_base(TimeBase::new(1, header.sample_rate))
-              .with_channels(header.channel_mode.channels());
+        params
+            .for_codec(CODEC_TYPE_MP3)
+            .with_sample_rate(header.sample_rate)
+            .with_time_base(TimeBase::new(1, header.sample_rate))
+            .with_channels(header.channel_mode.channels());
 
         let audio_frames_per_mpeg_frame = SAMPLES_PER_GRANULE * header.n_granules() as u64;
 
         // Check if there is a Xing/Info tag contained in the first frame.
         if let Some(info_tag) = try_read_info_tag(&packet, &header) {
-            // The base Xing/Info tag may contain the number of frames.
-            if let Some(n_mpeg_frames) = info_tag.num_frames {
-                params.with_n_frames(u64::from(n_mpeg_frames) * audio_frames_per_mpeg_frame);
-            }
-
             // The LAME tag contains ReplayGain and padding information.
-            if let Some(lame_tag) = info_tag.lame {
-                params.with_leading_padding(lame_tag.leading_padding)
-                      .with_trailing_padding(lame_tag.trailing_padding);
+            let (delay, padding) = if let Some(lame_tag) = info_tag.lame {
+                params.with_delay(lame_tag.enc_delay).with_padding(lame_tag.enc_padding);
+
+                (lame_tag.enc_delay, lame_tag.enc_padding)
             }
+            else {
+                (0, 0)
+            };
+
+            // The base Xing/Info tag may contain the number of frames.
+            if let Some(num_mpeg_frames) = info_tag.num_frames {
+                info!("using xing header for duration");
+
+                let num_frames = u64::from(num_mpeg_frames) * audio_frames_per_mpeg_frame;
+
+                // Adjust for gapless playback.
+                if options.enable_gapless {
+                    params.with_n_frames(num_frames - u64::from(delay) - u64::from(padding));
+                }
+                else {
+                    params.with_n_frames(num_frames);
+                }
+            }
+        }
+        else if let Some(vbri_tag) = try_read_vbri_tag(&packet) {
+            info!("using vbri header for duration");
+
+            let num_frames = u64::from(vbri_tag.num_mpeg_frames) * audio_frames_per_mpeg_frame;
+
+            // Check if there is a VBRI tag.
+            params.with_n_frames(num_frames);
         }
         else {
             // The first frame was not a Xing/Info header, rewind back to the start of the frame so
             // that it may be decoded.
-            source.rewind(header.frame_size + 4);
+            source.seek_buffered_rev(MPEG_HEADER_LEN + header.frame_size);
 
             // Likely not a VBR file, so estimate the duration if seekable.
             if source.is_seekable() {
@@ -104,25 +132,54 @@ impl FormatReader for Mp3Reader {
 
         Ok(Mp3Reader {
             reader: source,
-            tracks: vec![ Track::new(0, params) ],
+            tracks: vec![Track::new(0, params)],
             cues: Vec::new(),
             metadata: Default::default(),
+            options: *options,
             first_frame_pos,
             next_packet_ts: 0,
         })
     }
 
     fn next_packet(&mut self) -> Result<Packet> {
-        let (header, packet) = read_mpeg_frame(&mut self.reader)?;
+        let (header, packet) = loop {
+            // Read the next MPEG frame.
+            let (header, packet) = read_mpeg_frame(&mut self.reader)?;
+
+            // Check if the packet contains a Xing, Info, or VBRI tag.
+            if is_maybe_info_tag(&packet, &header) {
+                if try_read_info_tag(&packet, &header).is_some() {
+                    // Discard the packet and tag since it was not at the start of the stream.
+                    warn!("found an unexpected xing tag, discarding");
+                    continue;
+                }
+            }
+            else if is_maybe_vbri_tag(&packet) && try_read_vbri_tag(&packet).is_some() {
+                // Discard the packet and tag since it was not at the start of the stream.
+                warn!("found an unexpected vbri tag, discarding");
+                continue;
+            }
+
+            break (header, packet);
+        };
 
         // Each frame contains 1 or 2 granules with each granule being exactly 576 samples long.
-        let duration = SAMPLES_PER_GRANULE * header.n_granules() as u64;
-
         let ts = self.next_packet_ts;
+        let duration = SAMPLES_PER_GRANULE * header.n_granules() as u64;
 
         self.next_packet_ts += duration;
 
-        Ok(Packet::new_from_boxed_slice(0, ts, duration, packet.into_boxed_slice()))
+        let mut packet = Packet::new_from_boxed_slice(0, ts, duration, packet.into_boxed_slice());
+
+        if self.options.enable_gapless {
+            symphonia_core::formats::util::trim_packet(
+                &mut packet,
+                self.tracks[0].codec_params.delay.unwrap_or(0),
+                self.tracks[0].codec_params.n_frames,
+            );
+        }
+
+        Ok(packet)
     }
 
     fn metadata(&mut self) -> Metadata<'_> {
@@ -142,7 +199,7 @@ impl FormatReader for Mp3Reader {
         const REF_FRAMES_MASK: usize = MAX_REF_FRAMES - 1;
 
         // Get the timestamp of the desired audio frame.
-        let required_ts = match to {
+        let desired_ts = match to {
             // Frame timestamp given.
             SeekTo::TimeStamp { ts, .. } => ts,
             // Time value given, calculate frame timestamp from sample rate.
@@ -158,7 +215,18 @@ impl FormatReader for Mp3Reader {
             }
         };
 
-        debug!("seeking to ts={}", required_ts);
+        // If gapless playback is enabled, get the delay.
+        let delay = if self.options.enable_gapless {
+            u64::from(self.tracks[0].codec_params.delay.unwrap_or(0))
+        }
+        else {
+            0
+        };
+
+        // The required timestamp is offset by the delay.
+        let required_ts = desired_ts + delay;
+
+        debug!("seeking to ts={} (+{} delay = {})", desired_ts, delay, required_ts);
 
         // If the desired timestamp is less-than the next packet timestamp, attempt to seek
         // to the start of the stream.
@@ -174,14 +242,14 @@ impl FormatReader for Mp3Reader {
                 }
             }
             else {
-                return seek_error(SeekErrorKind::ForwardOnly)
+                return seek_error(SeekErrorKind::ForwardOnly);
             }
 
             // Successfuly seeked to the start of the stream, reset the next packet timestamp.
             self.next_packet_ts = 0;
         }
 
-        let mut frames : [FramePos; MAX_REF_FRAMES] = Default::default();
+        let mut frames: [FramePos; MAX_REF_FRAMES] = Default::default();
         let mut n_frames = 0;
 
         // Parse frames from the stream until the frame containing the desired timestamp is
@@ -197,7 +265,8 @@ impl FormatReader for Mp3Reader {
             let duration = SAMPLES_PER_GRANULE * header.n_granules() as u64;
 
             // Add the frame to the frame ring.
-            frames[n_frames & REF_FRAMES_MASK] = FramePos { pos: frame_pos, ts: self.next_packet_ts };
+            frames[n_frames & REF_FRAMES_MASK] =
+                FramePos { pos: frame_pos, ts: self.next_packet_ts };
             n_frames += 1;
 
             // If the next frame's timestamp would exceed the desired timestamp, rewind back to the
@@ -210,7 +279,8 @@ impl FormatReader for Mp3Reader {
                 let main_data_begin = read_main_data_begin(&mut self.reader, &header)? as u64;
 
                 debug!(
-                    "found frame with ts={} @ pos={} with main_data_begin={}",
+                    "found frame with ts={} ({}) @ pos={} with main_data_begin={}",
+                    self.next_packet_ts.saturating_sub(delay),
                     self.next_packet_ts,
                     frame_pos,
                     main_data_begin
@@ -238,9 +308,10 @@ impl FormatReader for Mp3Reader {
                     }
 
                     debug!(
-                        "will seek to ts={} (-{} frames) @ pos={} (-{} bytes)",
-                        ref_frame.ts,
+                        "will seek -{} frame(s) to ts={} ({}) @ pos={} (-{} bytes)",
                         n_ref_frames,
+                        ref_frame.ts.saturating_sub(delay),
+                        ref_frame.ts,
                         ref_frame.pos,
                         frame_pos - ref_frame.pos
                     );
@@ -260,15 +331,16 @@ impl FormatReader for Mp3Reader {
             self.next_packet_ts += duration;
         }
 
-        debug!("seeked to ts={} (delta={})",
-            self.next_packet_ts,
-            required_ts as i64 - self.next_packet_ts as i64);
+        let actual_ts = self.next_packet_ts.saturating_sub(delay);
 
-        Ok(SeekedTo {
-            track_id: 0,
-            required_ts,
-            actual_ts: self.next_packet_ts,
-        })
+        debug!(
+            "seeked to ts={} ({}) (delta={})",
+            actual_ts,
+            self.next_packet_ts,
+            self.next_packet_ts as i64 - required_ts as i64,
+        );
+
+        Ok(SeekedTo { track_id: 0, required_ts: required_ts - delay, actual_ts })
     }
 
     fn into_inner(self: Box<Self>) -> MediaSourceStream {
@@ -277,7 +349,6 @@ impl FormatReader for Mp3Reader {
 }
 
 /// Reads a MPEG frame and returns the header and buffer.
-#[inline(always)]
 fn read_mpeg_frame(reader: &mut MediaSourceStream) -> Result<(FrameHeader, Vec<u8>)> {
     let (header, header_word) = loop {
         // Sync to the next frame header.
@@ -292,14 +363,62 @@ fn read_mpeg_frame(reader: &mut MediaSourceStream) -> Result<(FrameHeader, Vec<u
     };
 
     // Allocate frame buffer.
-    let mut packet = vec![0u8; header.frame_size + 4];
-    packet[0..4].copy_from_slice(&header_word.to_be_bytes());
+    let mut packet = vec![0u8; MPEG_HEADER_LEN + header.frame_size];
+    packet[0..MPEG_HEADER_LEN].copy_from_slice(&header_word.to_be_bytes());
 
     // Read the frame body.
-    reader.read_buf_exact(&mut packet[4..])?;
+    reader.read_buf_exact(&mut packet[MPEG_HEADER_LEN..])?;
 
     // Return the parsed header and packet body.
     Ok((header, packet))
+}
+
+/// Reads a MPEG frame and checks if the next frame begins after the packet.
+fn read_mpeg_frame_strict(reader: &mut MediaSourceStream) -> Result<(FrameHeader, Vec<u8>)> {
+    loop {
+        // Read the next MPEG frame.
+        let (header, packet) = read_mpeg_frame(reader)?;
+
+        // Get the position before trying to read the next header.
+        let pos = reader.pos();
+
+        // Read a sync word from the stream. If this read fails then the file may have ended and
+        // this check cannot be performed.
+        if let Ok(sync) = header::read_frame_header_word_no_sync(reader) {
+            // If the stream is not synced to the next frame's sync word, or the next frame header
+            // is not parseable or similar to the current frame header, then reject the current
+            // packet since the stream likely synced to random data.
+            if !header::is_frame_header_word_synced(sync) || !is_frame_header_similar(&header, sync)
+            {
+                warn!("skipping junk at {} bytes", pos - packet.len() as u64);
+
+                // Seek back to the second byte of the rejected packet to prevent syncing to the
+                // same spot again.
+                reader.seek_buffered_rev(packet.len() + MPEG_HEADER_LEN - 1);
+                continue;
+            }
+        }
+
+        // Jump back to the position before the next header was read.
+        reader.seek_buffered(pos);
+
+        break Ok((header, packet));
+    }
+}
+
+/// Check if a sync word parses to a frame header that is similar to the one provided.
+fn is_frame_header_similar(header: &FrameHeader, sync: u32) -> bool {
+    if let Ok(candidate) = header::parse_frame_header(sync) {
+        if header.version == candidate.version
+            && header.layer == candidate.layer
+            && header.sample_rate == candidate.sample_rate
+            && header.n_channels() == candidate.n_channels()
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 #[derive(Default)]
@@ -330,7 +449,7 @@ fn read_main_data_begin<B: ReadBytes>(reader: &mut B, header: &FrameHeader) -> R
 /// Estimates the total number of MPEG frames in the media source stream.
 fn estimate_num_mpeg_frames(reader: &mut MediaSourceStream) -> Option<u64> {
     const MAX_FRAMES: u32 = 16;
-    const MAX_LEN: usize  = 16 * 1024;
+    const MAX_LEN: usize = 16 * 1024;
 
     // Macro to convert a Result to Option, and break a loop on exit.
     macro_rules! break_on_err {
@@ -360,7 +479,7 @@ fn estimate_num_mpeg_frames(reader: &mut MediaSourceStream) -> Option<u64> {
         let header = break_on_err!(header::parse_frame_header(header_val));
 
         // Tabulate the size.
-        total_frame_len += header.frame_size + 4;
+        total_frame_len += MPEG_HEADER_LEN + header.frame_size;
         total_frames += 1;
 
         // Ignore the frame body.
@@ -375,10 +494,13 @@ fn estimate_num_mpeg_frames(reader: &mut MediaSourceStream) -> Option<u64> {
     };
 
     // Rewind back to the first frame seen upon entering this function.
-    reader.rewind((reader.pos() - start_pos) as usize);
+    reader.seek_buffered_rev((reader.pos() - start_pos) as usize);
 
     num_mpeg_frames
 }
+
+const XING_TAG_ID: [u8; 4] = *b"Xing";
+const INFO_TAG_ID: [u8; 4] = *b"Info";
 
 /// The LAME tag is an extension to the Xing/Info tag.
 #[allow(dead_code)]
@@ -387,9 +509,8 @@ struct LameTag {
     replaygain_peak: Option<f32>,
     replaygain_radio: Option<f32>,
     replaygain_audiophile: Option<f32>,
-    trailing_padding: u32,
-    leading_padding: u32,
-    music_crc: u16,
+    enc_delay: u32,
+    enc_padding: u32,
 }
 
 /// The Xing/Info time additional information for regarding a MP3 file.
@@ -411,48 +532,38 @@ fn try_read_info_tag(buf: &[u8], header: &FrameHeader) -> Option<XingInfoTag> {
 }
 
 fn try_read_info_tag_inner(buf: &[u8], header: &FrameHeader) -> Result<Option<XingInfoTag>> {
+    // Do a quick check that this is a Xing/Info tag.
+    if !is_maybe_info_tag(buf, header) {
+        return Ok(None);
+    }
+
     // The position of the Xing/Info tag relative to the end of the header. This is equal to the
     // side information length for the frame.
-    let offset = match (header.version, header.channel_mode) {
-        (MpegVersion::Mpeg1, ChannelMode::Mono) => 17,
-        (MpegVersion::Mpeg1, _                ) => 32,
-        (_                 , ChannelMode::Mono) => 9,
-        (_                 , _                ) => 17,
-    };
+    let offset = header.side_info_len();
 
     // Start the CRC with the header and side information.
     let mut crc16 = Crc16AnsiLe::new(0);
-    crc16.process_buf_bytes(&buf[..offset + 4]);
+    crc16.process_buf_bytes(&buf[..offset + MPEG_HEADER_LEN]);
 
     // Start reading the Xing/Info tag after the side information.
-    let mut reader = MonitorStream::new(BufReader::new(&buf[offset + 4..]), crc16);
+    let mut reader = MonitorStream::new(BufReader::new(&buf[offset + MPEG_HEADER_LEN..]), crc16);
 
     // Check for Xing/Info header.
     let id = reader.read_quad_bytes()?;
 
-    if id != *b"Xing" && id != *b"Info" {
+    if id != XING_TAG_ID && id != INFO_TAG_ID {
         return Ok(None);
     }
 
     // The "Info" id is used for CBR files.
-    let is_cbr = id == *b"Info";
+    let is_cbr = id == INFO_TAG_ID;
 
     // Flags indicates what information is provided in this Xing/Info tag.
     let flags = reader.read_be_u32()?;
 
-    let num_frames = if flags & 0x1 != 0 {
-        Some(reader.read_be_u32()?)
-    }
-    else {
-        None
-    };
+    let num_frames = if flags & 0x1 != 0 { Some(reader.read_be_u32()?) } else { None };
 
-    let num_bytes = if flags & 0x2 != 0 {
-        Some(reader.read_be_u32()?)
-    }
-    else {
-        None
-    };
+    let num_bytes = if flags & 0x2 != 0 { Some(reader.read_be_u32()?) } else { None };
 
     let toc = if flags & 0x4 != 0 {
         let mut toc = [0; 100];
@@ -463,20 +574,16 @@ fn try_read_info_tag_inner(buf: &[u8], header: &FrameHeader) -> Result<Option<Xi
         None
     };
 
-    let quality = if flags & 0x8 != 0 {
-        Some(reader.read_be_u32()?)
-    }
-    else {
-        None
-    };
+    let quality = if flags & 0x8 != 0 { Some(reader.read_be_u32()?) } else { None };
 
-    const LAME_EXTENSION_LEN: u64 = 36;
+    /// The full LAME extension size.
+    const LAME_EXT_LEN: u64 = 36;
+    /// The minimal LAME extension size up-to the encode delay & padding fields.
+    const MIN_LAME_EXT_LEN: u64 = 24;
 
-    // The LAME extension may not always be present. We don't want to return an error if we try to
-    // read a frame that doesn't have the LAME extension, so ensure there is enough data to
-    // to potentially read one. Even if there are enough bytes available, it still does not
-    // guarantee what was read was a LAME tag, so the CRC will be used to make sure it was.
-    let lame = if reader.inner().bytes_available() >= LAME_EXTENSION_LEN {
+    // The LAME extension may not always be present, or complete. The important fields in the
+    // extension are within the first 24 bytes. Therefore, try to read those if they're available.
+    let lame = if reader.inner().bytes_available() >= MIN_LAME_EXT_LEN {
         // Encoder string.
         let mut encoder = [0; 9];
         reader.read_buf_exact(&mut encoder)?;
@@ -505,69 +612,82 @@ fn try_read_info_tag_inner(buf: &[u8], header: &FrameHeader) -> Result<Option<Xi
         // Arbitrary bitrate.
         let _abr = reader.read_u8()?;
 
-        let (leading_padding, trailing_padding) = {
-            let delay = reader.read_be_u24()?;
+        let (enc_delay, enc_padding) = {
+            let trim = reader.read_be_u24()?;
 
             if encoder[..4] == *b"LAME" || encoder[..4] == *b"Lavf" || encoder[..4] == *b"Lavc" {
-                // These encoders always add a 529 sample delay on-top of the stated encoder delay.
-                let leading = 528 + 1 + (delay >> 12);
-                let trailing = delay & ((1 << 12) - 1);
+                let delay = 528 + 1 + (trim >> 12);
+                let padding = trim & ((1 << 12) - 1);
 
-                (leading, trailing)
+                (delay, padding.saturating_sub(528 + 1))
             }
             else {
                 (0, 0)
             }
         };
 
-        // Misc.
-        let _misc = reader.read_u8()?;
+        // If possible, attempt to read the extra fields of the extension if they weren't
+        // truncated.
+        let crc = if reader.inner().bytes_available() >= LAME_EXT_LEN - MIN_LAME_EXT_LEN {
+            // Flags.
+            let _misc = reader.read_u8()?;
 
-        // MP3 gain.
-        let _mp3_gain = reader.read_u8()?;
+            // MP3 gain.
+            let _mp3_gain = reader.read_u8()?;
 
-        // Preset and surround info.
-        let _surround_info = reader.read_be_u16()?;
+            // Preset and surround info.
+            let _surround_info = reader.read_be_u16()?;
 
-        // Music length.
-        let _music_len = reader.read_be_u32()?;
+            // Music length.
+            let _music_len = reader.read_be_u32()?;
 
-        // Music (audio) CRC.
-        let music_crc = reader.read_be_u16()?;
+            // Music (audio) CRC.
+            let _music_crc = reader.read_be_u16()?;
 
-        // CRC (read using the inner reader to not change the computed CRC).
-        let crc = reader.inner_mut().read_be_u16()?;
+            // The tag CRC. LAME always includes this CRC regardless of the protection bit, but
+            // other encoders may only do so if the protection bit is set.
+            if header.has_crc || encoder[..4] == *b"LAME" {
+                // Read the CRC using the inner reader to not change the computed CRC.
+                Some(reader.inner_mut().read_be_u16()?)
+            }
+            else {
+                // No CRC is present.
+                None
+            }
+        }
+        else {
+            // The tag is truncated. No CRC will be present.
+            info!("xing tag lame extension is truncated");
+            None
+        };
 
-        if crc == reader.monitor().crc() {
-            // The CRC matched, return the LAME tag.
+        // If there is no CRC, then assume the tag is correct. Otherwise, use the CRC.
+        let is_tag_ok = crc.map_or(true, |crc| crc == reader.monitor().crc());
+
+        if is_tag_ok {
+            // The CRC matched or is not present.
             Some(LameTag {
                 encoder: String::from_utf8_lossy(&encoder).into(),
                 replaygain_peak,
                 replaygain_radio,
                 replaygain_audiophile,
-                trailing_padding,
-                leading_padding,
-                music_crc,
+                enc_delay,
+                enc_padding,
             })
         }
         else {
             // The CRC did not match, this is probably not a LAME tag.
+            warn!("xing tag lame extension crc mismatch");
             None
         }
     }
     else {
         // Frame not large enough for a LAME tag.
+        info!("xing tag too small for lame extension");
         None
     };
 
-    Ok(Some(XingInfoTag {
-        num_frames,
-        num_bytes,
-        toc,
-        quality,
-        is_cbr,
-        lame,
-    }))
+    Ok(Some(XingInfoTag { num_frames, num_bytes, toc, quality, is_cbr, lame }))
 }
 
 fn parse_lame_tag_replaygain(value: u16, expected_name: u8) -> Option<f32> {
@@ -581,4 +701,102 @@ fn parse_lame_tag_replaygain(value: u16, expected_name: u8) -> Option<f32> {
     else {
         None
     }
+}
+
+/// Perform a fast check to see if the packet contains a Xing/Info tag. If this returns true, the
+/// packet should be parsed fully to ensure it is in fact a tag.
+fn is_maybe_info_tag(buf: &[u8], header: &FrameHeader) -> bool {
+    const MIN_XING_TAG_LEN: usize = 8;
+
+    // The position of the Xing/Info tag relative to the start of the packet. This is equal to the
+    // side information length for the frame.
+    let offset = header.side_info_len() + MPEG_HEADER_LEN;
+
+    // The packet must be big enough to contain a tag.
+    if buf.len() < offset + MIN_XING_TAG_LEN {
+        return false;
+    }
+
+    // The tag ID must be present and correct.
+    let id = &buf[offset..offset + 4];
+
+    if id != XING_TAG_ID && id != INFO_TAG_ID {
+        return false;
+    }
+
+    // The side information should be zeroed.
+    !buf[MPEG_HEADER_LEN..offset].iter().any(|&b| b != 0)
+}
+
+const VBRI_TAG_ID: [u8; 4] = *b"VBRI";
+
+/// The contents of a VBRI tag.
+#[allow(dead_code)]
+struct VbriTag {
+    num_bytes: u32,
+    num_mpeg_frames: u32,
+}
+
+/// Try to read a VBRI tag from the provided MPEG frame.
+fn try_read_vbri_tag(buf: &[u8]) -> Option<VbriTag> {
+    // The VBRI header is a completely optional piece of information. Therefore, flatten an error
+    // reading the tag into a None.
+    try_read_vbri_tag_inner(buf).ok().flatten()
+}
+
+fn try_read_vbri_tag_inner(buf: &[u8]) -> Result<Option<VbriTag>> {
+    // Do a quick check that this is a VBRI tag.
+    if !is_maybe_vbri_tag(buf) {
+        return Ok(None);
+    }
+
+    let mut reader = BufReader::new(buf);
+
+    // The VBRI tag is always 32 bytes after the header.
+    reader.ignore_bytes(MPEG_HEADER_LEN as u64 + 32)?;
+
+    // Check for the VBRI signature.
+    let id = reader.read_quad_bytes()?;
+
+    if id != VBRI_TAG_ID {
+        return Ok(None);
+    }
+
+    // The version is always 1.
+    let version = reader.read_be_u16()?;
+
+    if version != 1 {
+        return Ok(None);
+    }
+
+    // Delay is a 2-byte big-endiann floating point value?
+    let _delay = reader.read_be_u16()?;
+    let _quality = reader.read_be_u16()?;
+
+    let num_bytes = reader.read_be_u32()?;
+    let num_mpeg_frames = reader.read_be_u32()?;
+
+    Ok(Some(VbriTag { num_bytes, num_mpeg_frames }))
+}
+
+/// Perform a fast check to see if the packet contains a VBRI tag. If this returns true, the
+/// packet should be parsed fully to ensure it is in fact a tag.
+fn is_maybe_vbri_tag(buf: &[u8]) -> bool {
+    const MIN_VBRI_TAG_LEN: usize = 26;
+    const VBRI_TAG_OFFSET: usize = 36;
+
+    // The packet must be big enough to contain a tag.
+    if buf.len() < VBRI_TAG_OFFSET + MIN_VBRI_TAG_LEN {
+        return false;
+    }
+
+    // The tag ID must be present and correct.
+    let id = &buf[VBRI_TAG_OFFSET..VBRI_TAG_OFFSET + 4];
+
+    if id != VBRI_TAG_ID {
+        return false;
+    }
+
+    // The bytes preceeding the VBRI tag (mostly the side information) should be all 0.
+    !buf[MPEG_HEADER_LEN..VBRI_TAG_OFFSET].iter().any(|&b| b != 0)
 }

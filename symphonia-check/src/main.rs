@@ -1,5 +1,5 @@
 // Symphonia Check Tool
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -7,7 +7,6 @@
 
 #![warn(rust_2018_idioms)]
 #![forbid(unsafe_code)]
-
 // Justification: Fields on DecoderOptions and FormatOptions may change at any time, but
 // symphonia-check doesn't want to be updated every time those fields change, therefore always fill
 // in the remaining fields with default values.
@@ -20,19 +19,43 @@ use std::process::{Command, Stdio};
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
 use symphonia::core::codecs::{Decoder, DecoderOptions};
 use symphonia::core::errors::{Error, Result};
-use symphonia::core::formats::{FormatReader, FormatOptions};
+use symphonia::core::formats::{FormatOptions, FormatReader};
 use symphonia::core::io::{MediaSourceStream, ReadOnlySource};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-use clap::{Arg, App};
+use clap::Arg;
 use log::{info, warn};
+
+/// The absolute maximum allowable sample delta. Around 2^-17 (-102.4dB).
+const ABS_MAX_ALLOWABLE_SAMPLE_DELTA: f32 = 0.00001;
+
+// The absolute maximum allowable sample delta for a fully compliant MP3 decoder as specified by the
+// ISO. Around 2^-14 (-84.2dB).
+// const ABS_MAX_ALLOWABLE_SAMPLE_DELTA_MP3: f32 = 0.00006104;
+
+#[derive(Copy, Clone)]
+enum RefDecoder {
+    Ffmpeg,
+    Flac,
+    Mpg123,
+    Oggdec,
+}
+
+impl Default for RefDecoder {
+    fn default() -> Self {
+        RefDecoder::Ffmpeg
+    }
+}
 
 #[derive(Default)]
 struct TestOptions {
+    ref_decoder: RefDecoder,
     is_quiet: bool,
     is_per_sample: bool,
     stop_after_fail: bool,
+    keep_going: bool,
+    gapless: bool,
 }
 
 #[derive(Default)]
@@ -41,6 +64,58 @@ struct TestResult {
     n_failed_samples: u64,
     n_packets: u64,
     n_failed_packets: u64,
+    abs_max_delta: f32,
+}
+
+fn build_ffmpeg_command(path: &str, gapless: bool) -> Command {
+    let mut cmd = Command::new("ffmpeg");
+
+    // Gapless argument must come before everything else.
+    if !gapless {
+        cmd.arg("-flags2").arg("skip_manual");
+    }
+
+    cmd.arg("-nostats") // Quiet command.
+        .arg("-hide_banner")
+        .arg("-i") // Input path.
+        .arg(path)
+        .arg("-map") // Select the first audio track.
+        .arg("0:a:0")
+        .arg("-c:a") // Encode audio to pcm_s32le.
+        .arg("pcm_f32le")
+        .arg("-f") // Output in WAVE format.
+        .arg("wav")
+        .arg("-") // Pipe output to stdout.
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null()); // Pipe errors to null.
+
+    cmd
+}
+
+fn build_flac_command(path: &str) -> Command {
+    let mut cmd = Command::new("flac");
+
+    cmd.arg("--stdout").arg("-d").arg(path).stdout(Stdio::piped()).stderr(Stdio::null());
+
+    cmd
+}
+
+fn build_mpg123_command(path: &str, gapless: bool) -> Command {
+    let mut cmd = Command::new("mpg123");
+
+    if !gapless {
+        cmd.arg("--no-gapless");
+    }
+
+    cmd.arg("--wav").arg("-").arg("--float").arg(path).stdout(Stdio::piped()).stderr(Stdio::null());
+
+    cmd
+}
+
+fn build_oggdec_command(path: &str) -> Command {
+    let mut cmd = Command::new("oggdec");
+    cmd.arg(path).arg("-o").arg("-").stdout(Stdio::piped()).stderr(Stdio::null());
+    cmd
 }
 
 struct RefProcess {
@@ -48,24 +123,15 @@ struct RefProcess {
 }
 
 impl RefProcess {
-    fn try_spawn(path: &str) -> Result<RefProcess> {
-        let mut cmd = Command::new("ffmpeg");
-        let cmd = cmd.arg("-flags2") // Do not trim encoder delay.
-                     .arg("skip_manual")
-                     .arg("-i")      // File path.
-                     .arg(path)
-                     .arg("-map")    // Select the first audio track.
-                     .arg("0:a:0")
-                     .arg("-c:a")    // Encode audio to pcm_s32le.
-                     .arg("pcm_f32le")
-                     .arg("-f")      // Output in WAVE format.
-                     .arg("wav")
-                     .arg("-")       // Pipe output to stdout.
-                     .stdout(Stdio::piped())
-                     .stderr(Stdio::null());    // Pipe errors to null.
+    fn try_spawn(decoder: RefDecoder, gapless: bool, path: &str) -> Result<RefProcess> {
+        let mut cmd = match decoder {
+            RefDecoder::Ffmpeg => build_ffmpeg_command(path, gapless),
+            RefDecoder::Flac => build_flac_command(path),
+            RefDecoder::Mpg123 => build_mpg123_command(path, gapless),
+            RefDecoder::Oggdec => build_oggdec_command(path),
+        };
 
         let child = cmd.spawn()?;
-
         Ok(RefProcess { child })
     }
 }
@@ -77,15 +143,14 @@ struct DecoderInstance {
 }
 
 impl DecoderInstance {
-    fn try_open(mss: MediaSourceStream) -> Result<DecoderInstance> {
+    fn try_open(mss: MediaSourceStream, fmt_opts: &FormatOptions) -> Result<DecoderInstance> {
         // Use the default options for metadata and format readers, and the decoder.
-        let fmt_opts: FormatOptions = Default::default();
         let meta_opts: MetadataOptions = Default::default();
         let dec_opts: DecoderOptions = Default::default();
 
         let hint = Hint::new();
 
-        let probed = symphonia::default::get_probe().format(&hint, mss, &fmt_opts, &meta_opts)?;
+        let probed = symphonia::default::get_probe().format(&hint, mss, fmt_opts, &meta_opts)?;
         let format = probed.format;
 
         let track = format.default_track().unwrap();
@@ -111,6 +176,16 @@ fn get_next_audio_buf(inst: &mut DecoderInstance) -> Result<AudioBufferRef<'_>> 
 
     // Decode packet audio.
     inst.decoder.decode(&pkt)
+}
+
+fn get_next_audio_buf_best_effort(inst: &mut DecoderInstance) -> Result<()> {
+    loop {
+        match get_next_audio_buf(inst) {
+            Ok(_) => break Ok(()),
+            Err(Error::DecodeError(err)) => warn!("{}", err),
+            Err(err) => break Err(err),
+        }
+    }
 }
 
 fn copy_audio_buf_to_sample_buf(src: AudioBufferRef<'_>, dst: &mut Option<SampleBuffer<f32>>) {
@@ -149,10 +224,15 @@ fn run_check(
 
     loop {
         // Decode target's next audio buffer.
-        let tgt_audio = get_next_audio_buf(tgt_inst)?;
+        if opts.keep_going {
+            get_next_audio_buf_best_effort(tgt_inst)?;
+        }
+        else {
+            get_next_audio_buf(tgt_inst)?;
+        }
 
         // Copy to the target's audio buffer into the target sample buffer.
-        copy_audio_buf_to_sample_buf(tgt_audio, &mut tgt_sample_buf);
+        copy_audio_buf_to_sample_buf(tgt_inst.decoder.last_decoded(), &mut tgt_sample_buf);
 
         // Get a slice of the target sample buffer.
         let mut tgt_samples = tgt_sample_buf.as_mut().unwrap().samples();
@@ -167,10 +247,10 @@ fn run_check(
             // Need to read a new reference packet.
             if ref_sample_pos == ref_sample_cnt {
                 // Get next reference audio buffer.
-                let ref_audio = get_next_audio_buf(ref_inst)?;
+                get_next_audio_buf_best_effort(ref_inst)?;
 
                 // Copy to reference audio buffer to reference sample buffer.
-                copy_audio_buf_to_sample_buf(ref_audio, &mut ref_sample_buf);
+                copy_audio_buf_to_sample_buf(ref_inst.decoder.last_decoded(), &mut ref_sample_buf);
 
                 // Save number of reference samples in the sample buffer and reset the sample buffer
                 // position counter.
@@ -186,18 +266,17 @@ fn run_check(
             let n_test_samples = std::cmp::min(ref_samples.len(), tgt_samples.len());
 
             // Perform the comparison.
-            for (&t, &r) in tgt_samples[..n_test_samples].iter()
-                                                         .zip(&ref_samples[..n_test_samples])
+            for (&t, &r) in tgt_samples[..n_test_samples].iter().zip(&ref_samples[..n_test_samples])
             {
-                // Clamp the reference and target samples between [-1.0, 1.0] and find the difference.
+                // Clamp the reference and target samples between [-1.0, 1.0] and find the
+                // difference.
                 let delta = t.clamp(-1.0, 1.0) - r.clamp(-1.0, 1.0);
 
-                if delta.abs() > 0.00001 {
-
+                if delta.abs() > ABS_MAX_ALLOWABLE_SAMPLE_DELTA {
                     // Print per-sample or per-packet failure nessage based on selected options.
                     if !opts.is_quiet && (opts.is_per_sample || n_failed_pkt_samples == 0) {
-                        eprintln!(
-                            "[FAIL] packet={:>6}, sample_num={:>12} ({:>4}), dec={:+.6}, ref={:+.6} ({:+.6})",
+                        println!(
+                            "[FAIL] packet={:>6}, sample_num={:>12} ({:>4}), dec={:+.8}, ref={:+.8} ({:+.8})",
                             acct.n_packets,
                             acct.n_samples,
                             acct.n_samples - sample_num_base,
@@ -210,6 +289,7 @@ fn run_check(
                     n_failed_pkt_samples += 1;
                 }
 
+                acct.abs_max_delta = acct.abs_max_delta.max(delta.abs());
                 acct.n_samples += 1;
             }
 
@@ -234,19 +314,21 @@ fn run_check(
 
 fn run_test(path: &str, opts: &TestOptions, result: &mut TestResult) -> Result<()> {
     // 1. Start the reference decoder process.
-    let mut ref_process = RefProcess::try_spawn(path)?;
+    let mut ref_process = RefProcess::try_spawn(opts.ref_decoder, opts.gapless, path)?;
 
     // 2. Instantiate a Symphonia decoder for the reference process output.
     let ref_ms = Box::new(ReadOnlySource::new(ref_process.child.stdout.take().unwrap()));
     let ref_mss = MediaSourceStream::new(ref_ms, Default::default());
 
-    let mut ref_inst = DecoderInstance::try_open(ref_mss)?;
+    let mut ref_inst = DecoderInstance::try_open(ref_mss, &Default::default())?;
 
     // 3. Instantiate a Symphonia decoder for the test target.
     let tgt_ms = Box::new(File::open(Path::new(path))?);
     let tgt_mss = MediaSourceStream::new(tgt_ms, Default::default());
 
-    let mut tgt_inst = DecoderInstance::try_open(tgt_mss)?;
+    let tgt_fmt_opts = FormatOptions { enable_gapless: opts.gapless, ..Default::default() };
+
+    let mut tgt_inst = DecoderInstance::try_open(tgt_mss, &tgt_fmt_opts)?;
 
     // 4. Begin check.
     run_check(&mut ref_inst, &mut tgt_inst, opts, result)
@@ -255,49 +337,70 @@ fn run_test(path: &str, opts: &TestOptions, result: &mut TestResult) -> Result<(
 fn main() {
     pretty_env_logger::init();
 
-    let matches = App::new("Symphonia Check")
-                        .version("1.0")
-                        .author("Philip Deljanov <philip.deljanov@gmail.com>")
-                        .about("Check Symphonia output with a reference decoding")
-                        .arg(Arg::with_name("samples")
-                            .long("samples")
-                            .help("Print failures per sample"))
-                        .arg(Arg::with_name("stop-after-fail")
-                            .long("first-fail")
-                            .short("f")
-                            .help("Stop testing after the first failed packet"))
-                        .arg(Arg::with_name("quiet")
-                            .long("quiet")
-                            .short("q")
-                            .help("Only print test results"))
-                        .arg(Arg::with_name("INPUT")
-                            .help("The input file path")
-                            .required(true)
-                            .index(1))
-                        .get_matches();
+    let matches = clap::Command::new("Symphonia Check")
+        .version("1.0")
+        .author("Philip Deljanov <philip.deljanov@gmail.com>")
+        .about("Check Symphonia output with a reference decoding")
+        .arg(Arg::new("samples").long("samples").help("Print failures per sample"))
+        .arg(
+            Arg::new("stop-after-fail")
+                .long("first-fail")
+                .short('f')
+                .help("Stop testing after the first failed packet"),
+        )
+        .arg(Arg::new("quiet").long("quiet").short('q').help("Only print test results"))
+        .arg(
+            Arg::new("keep-going")
+                .long("keep-going")
+                .help("Continue after a decode error (may cause many failures)"),
+        )
+        .arg(
+            Arg::new("decoder")
+                .long("ref")
+                .takes_value(true)
+                .possible_values(&["ffmpeg", "flac", "mpg123", "oggdec"])
+                .default_value("ffmpeg")
+                .help("Specify a particular decoder to be used as the reference"),
+        )
+        .arg(Arg::new("no-gapless").long("no-gapless").help("Disable gapless decoding"))
+        .arg(Arg::new("INPUT").help("The input file path").required(true).index(1))
+        .get_matches();
 
     let path = matches.value_of("INPUT").unwrap();
 
+    let ref_decoder = match matches.value_of("decoder").unwrap() {
+        "ffmpeg" => RefDecoder::Ffmpeg,
+        "flac" => RefDecoder::Flac,
+        "mpg123" => RefDecoder::Mpg123,
+        "oggdec" => RefDecoder::Oggdec,
+        _ => {
+            // This will never occur if the possible values of the argument are the same as the
+            // match arms above.
+            unreachable!()
+        }
+    };
+
     let opts = TestOptions {
+        ref_decoder,
         is_per_sample: matches.is_present("samples"),
         is_quiet: matches.is_present("quiet"),
         stop_after_fail: matches.is_present("stop-after-fail"),
+        keep_going: matches.is_present("keep-going"),
+        gapless: !matches.is_present("no-gapless"),
         ..Default::default()
     };
 
     let mut res: TestResult = Default::default();
 
-    if !opts.is_quiet {
-        println!("Input Path: {}", path);
-        println!();
-    }
+    println!("Input Path: {}", path);
+    println!();
 
     match run_test(path, &opts, &mut res) {
         Err(Error::IoError(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => (),
         Err(err) => {
             eprintln!("Test interrupted by error: {}", err);
             std::process::exit(2);
-        },
+        }
         _ => (),
     };
 
@@ -311,6 +414,8 @@ fn main() {
     println!("  Failed/Total Packets: {:>12}/{:>12}", res.n_failed_packets, res.n_packets);
     println!("  Failed/Total Samples: {:>12}/{:>12}", res.n_failed_samples, res.n_samples);
     println!();
+    println!("  Absolute Maximum Sample Delta:       {:.8}", res.abs_max_delta);
+    println!();
 
     let ret = if res.n_failed_samples == 0 {
         println!("PASS");
@@ -320,11 +425,7 @@ fn main() {
         println!("FAIL");
         1
     };
+    println!();
 
     std::process::exit(ret);
 }
-
-
-
-
-

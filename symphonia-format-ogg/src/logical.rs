@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -8,17 +8,18 @@
 use std::collections::VecDeque;
 
 use symphonia_core::codecs::CodecParameters;
-use symphonia_core::errors::{Result, decode_error};
+use symphonia_core::errors::{decode_error, Result};
+use symphonia_core::formats::Packet;
 
-use super::common::{OggPacket, SideData};
-use super::mappings::{MapResult, PacketParser};
+use super::common::SideData;
 use super::mappings::Mapper;
+use super::mappings::{MapResult, PacketParser};
 use super::page::Page;
 
 use log::{debug, warn};
 
 #[allow(dead_code)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 struct Bound {
     seq: u32,
     ts: u64,
@@ -29,7 +30,7 @@ struct Bound {
 #[derive(Copy, Clone)]
 struct PageInfo {
     seq: u32,
-    ts: u64,
+    absgp: u64,
 }
 
 #[derive(Default)]
@@ -40,18 +41,19 @@ pub struct InspectState {
 
 pub struct LogicalStream {
     mapper: Box<dyn Mapper>,
-    packets: VecDeque<OggPacket>,
+    packets: VecDeque<Packet>,
     part_buf: Vec<u8>,
     part_len: usize,
     prev_page_info: Option<PageInfo>,
     start_bound: Option<Bound>,
     end_bound: Option<Bound>,
+    gapless: bool,
 }
 
 impl LogicalStream {
     const MAX_PACKET_LEN: usize = 8 * 1024 * 1024;
 
-    pub fn new(mapper: Box<dyn Mapper>) -> Self {
+    pub fn new(mapper: Box<dyn Mapper>, gapless: bool) -> Self {
         LogicalStream {
             mapper,
             packets: Default::default(),
@@ -60,6 +62,7 @@ impl LogicalStream {
             prev_page_info: None,
             start_bound: None,
             end_bound: None,
+            gapless,
         }
     }
 
@@ -92,7 +95,6 @@ impl LogicalStream {
             if page.header.sequence < last_ts.seq {
                 warn!("detected stream page non-monotonicity");
                 self.part_len = 0;
-
             }
             else if page.header.sequence - last_ts.seq > 1 {
                 warn!(
@@ -103,12 +105,13 @@ impl LogicalStream {
             }
         }
 
-        self.prev_page_info = Some(PageInfo { seq: page.header.sequence, ts: page.header.absgp });
+        self.prev_page_info =
+            Some(PageInfo { seq: page.header.sequence, absgp: page.header.absgp });
 
         let mut iter = page.packets();
 
         // If there is partial packet data buffered, a continuation page is expected.
-        if !page.header.is_continuation && self.part_len > 0  {
+        if !page.header.is_continuation && self.part_len > 0 {
             warn!("expected a continuation page");
 
             // Clear partial packet data.
@@ -140,9 +143,13 @@ impl LogicalStream {
             // types of packet data.
             match self.mapper.map_packet(&data) {
                 Ok(MapResult::StreamData { dur }) => {
-                    // Create an Ogg packet.
-                    let packet = OggPacket { serial: page.header.serial, ts: 0, dur, data };
-                    self.packets.push_back(packet);
+                    // Create a packet.
+                    self.packets.push_back(Packet::new_from_boxed_slice(
+                        page.header.serial,
+                        0,
+                        dur,
+                        data,
+                    ));
                 }
                 Ok(MapResult::SideData { data }) => side_data.push(data),
                 Err(e) => {
@@ -167,8 +174,8 @@ impl LogicalStream {
 
             // Assign timestamps by first calculating the timestamp of one past the last sample in
             // in the last packet of this page, add the start delay.
-            let mut page_end_ts = self.mapper.absgp_to_ts(page.header.absgp)
-                                             .saturating_add(start_delay);
+            let mut page_end_ts =
+                self.mapper.absgp_to_ts(page.header.absgp).saturating_add(start_delay);
 
             // If this is the last page, then add the end delay to the timestamp.
             if page.header.is_last_page {
@@ -185,6 +192,16 @@ impl LogicalStream {
                 page_dur = page_dur.saturating_add(packet.dur);
                 packet.ts = page_end_ts.saturating_sub(page_dur);
             }
+
+            if self.gapless {
+                for packet in self.packets.iter_mut().rev().take(num_new_packets) {
+                    symphonia_core::formats::util::trim_packet(
+                        packet,
+                        start_delay as u32,
+                        self.end_bound.as_ref().map(|b| b.ts),
+                    );
+                }
+            }
         }
 
         Ok(side_data)
@@ -196,12 +213,12 @@ impl LogicalStream {
     }
 
     /// Examine, but do not consume, the next packet.
-    pub fn peek_packet(&self) -> Option<&OggPacket> {
+    pub fn peek_packet(&self) -> Option<&Packet> {
         self.packets.front()
     }
 
     /// Consumes and returns the next packet.
-    pub fn next_packet(&mut self) -> Option<OggPacket> {
+    pub fn next_packet(&mut self) -> Option<Packet> {
         self.packets.pop_front()
     }
 
@@ -251,7 +268,7 @@ impl LogicalStream {
         codec_params.with_start_ts(bound.ts);
 
         if bound.delay > 0 {
-            codec_params.with_leading_padding(bound.delay as u32);
+            codec_params.with_delay(bound.delay as u32);
         }
 
         // Update start bound.
@@ -287,8 +304,10 @@ impl LogicalStream {
         let start_delay = self.start_bound.as_ref().map_or(0, |b| b.delay);
 
         // The actual page end timestamp is the absolute granule position + the start delay.
-        let page_end_ts = self.mapper.absgp_to_ts(page.header.absgp)
-                                     .saturating_add(start_delay);
+        let page_end_ts = self
+            .mapper
+            .absgp_to_ts(page.header.absgp)
+            .saturating_add(if self.gapless { 0 } else { start_delay });
 
         // Calculate the page duration. Note that even though only the last page uses this duration,
         // it is important to feed the packet parser so that the first packet of the final page
@@ -308,7 +327,12 @@ impl LogicalStream {
                 let actual_page_end_ts = last_bound.ts.saturating_add(page_dur);
 
                 // Any samples after the stated timestamp of this page are considered delay samples.
-                if actual_page_end_ts > page_end_ts { actual_page_end_ts - page_end_ts } else { 0 }
+                if actual_page_end_ts > page_end_ts {
+                    actual_page_end_ts - page_end_ts
+                }
+                else {
+                    0
+                }
             }
             else {
                 // Don't have the timestamp of the previous page so it is not possible to
@@ -327,12 +351,15 @@ impl LogicalStream {
         if page.header.is_last_page {
             let codec_params = self.mapper.codec_params_mut();
 
-            if bound.ts > 0 {
-                codec_params.with_n_frames(bound.ts - codec_params.start_ts);
+            // Do not report the end delay if gapless is enabled.
+            let block_end_ts = bound.ts + if self.gapless { 0 } else { bound.delay };
+
+            if block_end_ts > codec_params.start_ts {
+                codec_params.with_n_frames(block_end_ts - codec_params.start_ts);
             }
 
             if bound.delay > 0 {
-                codec_params.with_trailing_padding(bound.delay as u32);
+                codec_params.with_padding(bound.delay as u32);
             }
 
             self.end_bound = Some(bound)
@@ -358,21 +385,33 @@ impl LogicalStream {
             }
         }
 
-        // Add start delay to the timestamp of the page.
-        let mut page_end_ts = self.mapper.absgp_to_ts(page.header.absgp)
-                                         .saturating_add(start_delay);
-
-        // If this is the final page, add in the end delay of the page.
-        if page.header.is_last_page {
-            let end_delay = self.end_bound.as_ref().map_or(0, |b| b.delay);
-            page_end_ts = page_end_ts.saturating_add(end_delay);
+        // If this is the final page, get the end delay.
+        let end_delay = if page.header.is_last_page {
+            self.end_bound.as_ref().map_or(0, |b| b.delay)
         }
+        else {
+            0
+        };
 
-        // Get the start timestamp of the page by subtracting the cumulative packet duration from
-        // the end timestamp.
+        // The total delay.
+        let delay = start_delay + end_delay;
+
+        // Add the total delay to the page end timestamp.
+        let page_end_ts = self.mapper.absgp_to_ts(page.header.absgp).saturating_add(delay);
+
+        // Get the page start timestamp of the page by subtracting the cumulative packet duration.
         let page_start_ts = page_end_ts.saturating_sub(page_dur);
 
-        (page_start_ts, page_end_ts)
+        if !self.gapless {
+            // If gapless playback is disabled, then report the start and end timestamps with the
+            // delays incorporated.
+            (page_start_ts, page_end_ts)
+        }
+        else {
+            // If gapless playback is enabled, report the start and end timestamps without the
+            // delays.
+            (page_start_ts.saturating_sub(delay), page_end_ts.saturating_sub(delay))
+        }
     }
 
     fn get_packet(&mut self, packet_buf: &[u8]) -> Box<[u8]> {

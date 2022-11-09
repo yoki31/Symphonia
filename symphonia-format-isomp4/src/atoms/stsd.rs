@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -7,19 +7,19 @@
 
 use symphonia_core::audio::Channels;
 use symphonia_core::codecs::{CodecParameters, CodecType, CODEC_TYPE_MP3, CODEC_TYPE_NULL};
-use symphonia_core::codecs::{CODEC_TYPE_PCM_S8, CODEC_TYPE_PCM_U8};
-use symphonia_core::codecs::{CODEC_TYPE_PCM_S16BE, CODEC_TYPE_PCM_S16LE};
-use symphonia_core::codecs::{CODEC_TYPE_PCM_U16BE, CODEC_TYPE_PCM_U16LE};
-use symphonia_core::codecs::{CODEC_TYPE_PCM_S24BE, CODEC_TYPE_PCM_S24LE};
-use symphonia_core::codecs::{CODEC_TYPE_PCM_U24BE, CODEC_TYPE_PCM_U24LE};
-use symphonia_core::codecs::{CODEC_TYPE_PCM_S32BE, CODEC_TYPE_PCM_S32LE};
-use symphonia_core::codecs::{CODEC_TYPE_PCM_U32BE, CODEC_TYPE_PCM_U32LE};
 use symphonia_core::codecs::{CODEC_TYPE_PCM_F32BE, CODEC_TYPE_PCM_F32LE};
 use symphonia_core::codecs::{CODEC_TYPE_PCM_F64BE, CODEC_TYPE_PCM_F64LE};
-use symphonia_core::errors::{Result, decode_error, unsupported_error};
+use symphonia_core::codecs::{CODEC_TYPE_PCM_S16BE, CODEC_TYPE_PCM_S16LE};
+use symphonia_core::codecs::{CODEC_TYPE_PCM_S24BE, CODEC_TYPE_PCM_S24LE};
+use symphonia_core::codecs::{CODEC_TYPE_PCM_S32BE, CODEC_TYPE_PCM_S32LE};
+use symphonia_core::codecs::{CODEC_TYPE_PCM_S8, CODEC_TYPE_PCM_U8};
+use symphonia_core::codecs::{CODEC_TYPE_PCM_U16BE, CODEC_TYPE_PCM_U16LE};
+use symphonia_core::codecs::{CODEC_TYPE_PCM_U24BE, CODEC_TYPE_PCM_U24LE};
+use symphonia_core::codecs::{CODEC_TYPE_PCM_U32BE, CODEC_TYPE_PCM_U32LE};
+use symphonia_core::errors::{decode_error, unsupported_error, Result};
 use symphonia_core::io::ReadBytes;
 
-use crate::atoms::{Atom, AtomHeader, AtomType, AlacAtom, EsdsAtom, WaveAtom, FlacAtom, OpusAtom};
+use crate::atoms::{AlacAtom, Atom, AtomHeader, AtomType, EsdsAtom, FlacAtom, OpusAtom, WaveAtom};
 use crate::fp::FpU16;
 
 use super::AtomIterator;
@@ -69,59 +69,53 @@ impl Atom for StsdAtom {
             | AtomType::S24SampleEntry
             | AtomType::S32SampleEntry
             | AtomType::F32SampleEntry
-            | AtomType::F64SampleEntry => {
-                read_audio_sample_entry(reader, sample_entry_header)?
-            }
+            | AtomType::F64SampleEntry => read_audio_sample_entry(reader, sample_entry_header)?,
             _ => {
                 // Potentially video, subtitles, etc.
                 SampleEntry::Other
-            },
+            }
         };
 
-        Ok(StsdAtom {
-            header,
-            sample_entry,
-        })
+        Ok(StsdAtom { header, sample_entry })
     }
 }
 
 impl StsdAtom {
     /// Fill the provided `CodecParameters` using the sample entry.
     pub fn fill_codec_params(&self, codec_params: &mut CodecParameters) {
-        match self.sample_entry {
-            SampleEntry::Audio(ref entry) => {
-                // General audio parameters.
-                codec_params.with_sample_rate(entry.sample_rate as u32);
+        // Audio sample entry.
+        if let SampleEntry::Audio(ref entry) = self.sample_entry {
+            // General audio parameters.
+            codec_params.with_sample_rate(entry.sample_rate as u32);
 
-                // Codec-specific parameters.
-                match entry.codec_specific {
-                    Some(AudioCodecSpecific::Esds(ref esds)) => {
-                        esds.fill_codec_params(codec_params);
-                    }
-                    Some(AudioCodecSpecific::Alac(ref alac)) => {
-                        alac.fill_codec_params(codec_params);
-                    }
-                    Some(AudioCodecSpecific::Flac(ref flac)) => {
-                        flac.fill_codec_params(codec_params);
-                    }
-                    Some(AudioCodecSpecific::Opus(ref opus)) => {
-                        opus.fill_codec_params(codec_params);
-                    }
-                    Some(AudioCodecSpecific::Mp3) => {
-                        codec_params.for_codec(CODEC_TYPE_MP3);
-                    }
-                    Some(AudioCodecSpecific::Pcm(ref pcm)) => {
-                        // PCM codecs.
-                        codec_params.for_codec(pcm.codec_type)
-                                    .with_bits_per_coded_sample(pcm.bits_per_coded_sample)
-                                    .with_bits_per_sample(pcm.bits_per_sample)
-                                    .with_max_frames_per_packet(pcm.frames_per_packet)
-                                    .with_channels(pcm.channels);
-                    }
-                    _ => (),
+            // Codec-specific parameters.
+            match entry.codec_specific {
+                Some(AudioCodecSpecific::Esds(ref esds)) => {
+                    esds.fill_codec_params(codec_params);
                 }
+                Some(AudioCodecSpecific::Alac(ref alac)) => {
+                    alac.fill_codec_params(codec_params);
+                }
+                Some(AudioCodecSpecific::Flac(ref flac)) => {
+                    flac.fill_codec_params(codec_params);
+                }
+                Some(AudioCodecSpecific::Opus(ref opus)) => {
+                    opus.fill_codec_params(codec_params);
+                }
+                Some(AudioCodecSpecific::Mp3) => {
+                    codec_params.for_codec(CODEC_TYPE_MP3);
+                }
+                Some(AudioCodecSpecific::Pcm(ref pcm)) => {
+                    // PCM codecs.
+                    codec_params
+                        .for_codec(pcm.codec_type)
+                        .with_bits_per_coded_sample(pcm.bits_per_coded_sample)
+                        .with_bits_per_sample(pcm.bits_per_sample)
+                        .with_max_frames_per_packet(pcm.frames_per_packet)
+                        .with_channels(pcm.channels);
+                }
+                _ => (),
             }
-            _ => ()
         }
     }
 }
@@ -213,8 +207,22 @@ fn lpcm_codec_type(bits_per_sample: u32, lpcm_flags: u32) -> CodecType {
     if is_floating_point {
         // Floating-point sample format.
         match bits_per_sample {
-            32 => if is_big_endian { CODEC_TYPE_PCM_F32BE } else { CODEC_TYPE_PCM_F32LE },
-            64 => if is_big_endian { CODEC_TYPE_PCM_F64BE } else { CODEC_TYPE_PCM_F64LE },
+            32 => {
+                if is_big_endian {
+                    CODEC_TYPE_PCM_F32BE
+                }
+                else {
+                    CODEC_TYPE_PCM_F32LE
+                }
+            }
+            64 => {
+                if is_big_endian {
+                    CODEC_TYPE_PCM_F64BE
+                }
+                else {
+                    CODEC_TYPE_PCM_F64LE
+                }
+            }
             _ => CODEC_TYPE_NULL,
         }
     }
@@ -223,20 +231,62 @@ fn lpcm_codec_type(bits_per_sample: u32, lpcm_flags: u32) -> CodecType {
         if is_signed {
             // Signed-integer sample format.
             match bits_per_sample {
-                8  => CODEC_TYPE_PCM_S8,
-                16 => if is_big_endian { CODEC_TYPE_PCM_S16BE } else { CODEC_TYPE_PCM_S16LE },
-                24 => if is_big_endian { CODEC_TYPE_PCM_S24BE } else { CODEC_TYPE_PCM_S24LE },
-                32 => if is_big_endian { CODEC_TYPE_PCM_S32BE } else { CODEC_TYPE_PCM_S32LE },
+                8 => CODEC_TYPE_PCM_S8,
+                16 => {
+                    if is_big_endian {
+                        CODEC_TYPE_PCM_S16BE
+                    }
+                    else {
+                        CODEC_TYPE_PCM_S16LE
+                    }
+                }
+                24 => {
+                    if is_big_endian {
+                        CODEC_TYPE_PCM_S24BE
+                    }
+                    else {
+                        CODEC_TYPE_PCM_S24LE
+                    }
+                }
+                32 => {
+                    if is_big_endian {
+                        CODEC_TYPE_PCM_S32BE
+                    }
+                    else {
+                        CODEC_TYPE_PCM_S32LE
+                    }
+                }
                 _ => CODEC_TYPE_NULL,
             }
         }
         else {
             // Unsigned-integer sample format.
             match bits_per_sample {
-                8  => CODEC_TYPE_PCM_U8,
-                16 => if is_big_endian { CODEC_TYPE_PCM_U16BE } else { CODEC_TYPE_PCM_U16LE },
-                24 => if is_big_endian { CODEC_TYPE_PCM_U24BE } else { CODEC_TYPE_PCM_U24LE },
-                32 => if is_big_endian { CODEC_TYPE_PCM_U32BE } else { CODEC_TYPE_PCM_U32LE },
+                8 => CODEC_TYPE_PCM_U8,
+                16 => {
+                    if is_big_endian {
+                        CODEC_TYPE_PCM_U16BE
+                    }
+                    else {
+                        CODEC_TYPE_PCM_U16LE
+                    }
+                }
+                24 => {
+                    if is_big_endian {
+                        CODEC_TYPE_PCM_U24BE
+                    }
+                    else {
+                        CODEC_TYPE_PCM_U24LE
+                    }
+                }
+                32 => {
+                    if is_big_endian {
+                        CODEC_TYPE_PCM_U32BE
+                    }
+                    else {
+                        CODEC_TYPE_PCM_U32LE
+                    }
+                }
                 _ => CODEC_TYPE_NULL,
             }
         }
@@ -266,12 +316,15 @@ fn lpcm_channels(num_channels: u32) -> Result<Channels> {
     // does not have a way to represent this yet.
     let channel_mask = !((!0 << 1) << (num_channels - 1));
 
-    Ok(Channels::from_bits(channel_mask).unwrap())
+    match Channels::from_bits(channel_mask) {
+        Some(channels) => Ok(channels),
+        _ => unsupported_error("isomp4: unsupported number of channels"),
+    }
 }
 
 fn read_audio_sample_entry<B: ReadBytes>(
     reader: &mut B,
-    mut header: AtomHeader
+    mut header: AtomHeader,
 ) -> Result<SampleEntry> {
     // An audio sample entry atom is derived from a base sample entry atom. The audio sample entry
     // atom contains the fields of the base sample entry first, then the audio sample entry fields
@@ -475,12 +528,10 @@ fn read_audio_sample_entry<B: ReadBytes>(
         codec_specific = Some(AudioCodecSpecific::Mp3);
     }
 
-    Ok(SampleEntry::Audio (
-        AudioSampleEntry {
-            num_channels,
-            sample_size,
-            sample_rate,
-            codec_specific,
-        }
-    ))
+    Ok(SampleEntry::Audio(AudioSampleEntry {
+        num_channels,
+        sample_size,
+        sample_rate,
+        codec_specific,
+    }))
 }

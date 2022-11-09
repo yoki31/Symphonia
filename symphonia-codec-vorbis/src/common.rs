@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -17,7 +17,7 @@ pub fn ilog(x: u32) -> u32 {
 pub struct BitSetIterator<'a> {
     bits: &'a [u32],
     pos: usize,
-    count: u32,
+    count: usize,
 }
 
 impl<'a> Iterator for BitSetIterator<'a> {
@@ -53,7 +53,7 @@ macro_rules! decl_bitset {
         #[derive(Default)]
         pub struct $name {
             bits: [u32; $size >> 5],
-            bit_count: u32,
+            bit_count: usize,
         }
 
         impl $name {
@@ -79,7 +79,7 @@ macro_rules! decl_bitset {
             }
 
             #[inline(always)]
-            pub fn count(&self) -> u32 {
+            pub fn count(&self) -> usize {
                 self.bit_count
             }
 

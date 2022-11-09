@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -10,14 +10,14 @@ use crate::common::SideData;
 use super::{MapResult, Mapper, PacketParser};
 
 use symphonia_core::checksum::Crc8Ccitt;
-use symphonia_core::codecs::{CODEC_TYPE_FLAC, CodecParameters, VerificationCheck};
-use symphonia_core::errors::{Result, decode_error};
-use symphonia_core::io::{BufReader, ReadBytes, MonitorStream};
+use symphonia_core::codecs::{CodecParameters, VerificationCheck, CODEC_TYPE_FLAC};
+use symphonia_core::errors::{decode_error, Result};
+use symphonia_core::io::{BufReader, MonitorStream, ReadBytes};
 use symphonia_core::meta::MetadataBuilder;
 use symphonia_core::units::TimeBase;
 
-use symphonia_utils_xiph::flac::metadata::{MetadataBlockHeader, MetadataBlockType, StreamInfo};
 use symphonia_utils_xiph::flac::metadata::{read_comment_block, read_picture_block};
+use symphonia_utils_xiph::flac::metadata::{MetadataBlockHeader, MetadataBlockType, StreamInfo};
 
 use log::warn;
 
@@ -80,19 +80,26 @@ pub fn detect(buf: &[u8]) -> Result<Option<Box<dyn Mapper>>> {
         return Ok(None);
     }
 
-    let stream_info = StreamInfo::read(&mut reader)?;
+    // Ensure the block length is correct for a stream information block before allocating a buffer
+    // for it.
+    if !StreamInfo::is_valid_size(u64::from(header.block_len)) {
+        return Ok(None);
+    }
+
+    let extra_data = reader.read_boxed_slice_exact(header.block_len as usize)?;
+    let stream_info = StreamInfo::read(&mut BufReader::new(&extra_data))?;
 
     // Populate the codec parameters with the information read from the stream information block.
     let mut codec_params = CodecParameters::new();
 
     codec_params
         .for_codec(CODEC_TYPE_FLAC)
+        .with_packet_data_integrity(true)
+        .with_extra_data(extra_data)
         .with_sample_rate(stream_info.sample_rate)
         .with_time_base(TimeBase::new(1, stream_info.sample_rate))
         .with_bits_per_sample(stream_info.bits_per_sample)
-        .with_max_frames_per_packet(u64::from(stream_info.block_len_max))
         .with_channels(stream_info.channels)
-        .with_packet_data_integrity(true)
         .with_verification_code(VerificationCheck::Md5(stream_info.md5));
 
     if let Some(n_frames) = stream_info.n_samples {
@@ -100,15 +107,13 @@ pub fn detect(buf: &[u8]) -> Result<Option<Box<dyn Mapper>>> {
     }
 
     // Instantiate the FLAC mapper.
-    let mapper = Box::new(FlacMapper {
-        codec_params,
-    });
+    let mapper = Box::new(FlacMapper { codec_params });
 
     Ok(Some(mapper))
 }
 
 /// Decodes a big-endian unsigned integer encoded via extended UTF8.
-fn utf8_decode_be_u64<B: ReadBytes>(src : &mut B) -> Result<Option<u64>> {
+fn utf8_decode_be_u64<B: ReadBytes>(src: &mut B) -> Result<Option<u64>> {
     // NOTE: See the symphonia-bundle-flac crate for a detailed description of this function.
     let mut state = u64::from(src.read_u8()?);
 
@@ -119,8 +124,8 @@ fn utf8_decode_be_u64<B: ReadBytes>(src : &mut B) -> Result<Option<u64>> {
         0xf0..=0xf7 => 0x07,
         0xf8..=0xfb => 0x03,
         0xfc..=0xfd => 0x01,
-        0xfe        => 0x00,
-        _           => return Ok(None)
+        0xfe => 0x00,
+        _ => return Ok(None),
     };
 
     state &= u64::from(mask);
@@ -195,24 +200,24 @@ fn decode_frame_header(buf: &[u8]) -> Result<FrameHeader> {
     let block_size_enc = u32::from((desc & 0xf000) >> 12);
 
     let block_size = match block_size_enc {
-        0x1       => 192,
+        0x1 => 192,
         0x2..=0x5 => 576 * (1 << (block_size_enc - 2)),
-        0x6       => u64::from(reader_crc8.read_u8()?) + 1,
-        0x7       => {
+        0x6 => u64::from(reader_crc8.read_u8()?) + 1,
+        0x7 => {
             let block_size = reader_crc8.read_be_u16()?;
             if block_size == 0xffff {
                 return decode_error("ogg (flac): block size not allowed to be greater than 65535");
             }
 
             u64::from(block_size) + 1
-        },
+        }
         0x8..=0xf => 256 * (1 << (block_size_enc - 8)),
-        _         => return decode_error("ogg (flac): block size set to reserved value"),
+        _ => return decode_error("ogg (flac): block size set to reserved value"),
     };
 
     // The sample rate is not required but should be read so checksum verification of the header
     // can be performed.
-    let sample_rate_enc = u32::from((desc & 0x0f00) >>  8);
+    let sample_rate_enc = u32::from((desc & 0x0f00) >> 8);
 
     match sample_rate_enc {
         0xc => {
@@ -289,7 +294,6 @@ impl Mapper for FlacMapper {
                 _ => 0,
             };
 
-
             Ok(MapResult::StreamData { dur })
         }
         else if packet_type == 0x00 || packet_type == 0x80 {
@@ -318,11 +322,8 @@ impl Mapper for FlacMapper {
 
                     Ok(MapResult::SideData { data: SideData::Metadata(builder.metadata()) })
                 }
-                _ => {
-                    Ok(MapResult::Unknown)
-                }
+                _ => Ok(MapResult::Unknown),
             }
         }
     }
-
 }

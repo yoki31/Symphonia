@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -39,7 +39,7 @@ pub use scoped_stream::ScopedStream;
 ///
 /// Despite requiring the [`std::io::Seek`] trait, seeking is an optional capability that can be
 /// queried at runtime.
-pub trait MediaSource: io::Read + io::Seek + Send {
+pub trait MediaSource: io::Read + io::Seek + Send + Sync {
     /// Returns if the source is seekable. This may be an expensive operation.
     fn is_seekable(&self) -> bool;
 
@@ -58,7 +58,7 @@ impl MediaSource for std::fs::File {
         // metadata() follows symlinks.
         match self.metadata() {
             Ok(metadata) => metadata.is_file(),
-            _ => false
+            _ => false,
         }
     }
 
@@ -74,7 +74,7 @@ impl MediaSource for std::fs::File {
     }
 }
 
-impl<T: std::convert::AsRef<[u8]> + Send> MediaSource for io::Cursor<T> {
+impl<T: std::convert::AsRef<[u8]> + Send + Sync> MediaSource for io::Cursor<T> {
     /// Always returns true since a `io::Cursor<u8>` is always seekable.
     fn is_seekable(&self) -> bool {
         true
@@ -118,7 +118,7 @@ impl<R: io::Read + Send> ReadOnlySource<R> {
     }
 }
 
-impl<R: io::Read + Send> MediaSource for ReadOnlySource<R> {
+impl<R: io::Read + Send + Sync> MediaSource for ReadOnlySource<R> {
     fn is_seekable(&self) -> bool {
         false
     }
@@ -140,7 +140,7 @@ impl<R: io::Read> io::Seek for ReadOnlySource<R> {
     }
 }
 
-/// `ReadBytes` provides functions to read bytes and interpret them as little- or big-endian
+/// `ReadBytes` provides methods to read bytes and interpret them as little- or big-endian
 /// unsigned integers or floating-point values of standard widths.
 pub trait ReadBytes {
     /// Reads a single byte from the stream and returns it or an error.
@@ -290,9 +290,10 @@ pub trait ReadBytes {
     /// Reads bytes from a stream into a supplied buffer until a byte patter is matched on an
     /// aligned byte boundary. Returns a mutable slice to the valid region of the provided buffer.
     fn scan_bytes_aligned<'a>(
-        &mut self, pattern: &[u8],
+        &mut self,
+        pattern: &[u8],
         align: usize,
-        buf: &'a mut [u8]
+        buf: &'a mut [u8],
     ) -> io::Result<&'a mut [u8]>;
 
     /// Ignores the specified number of bytes from the stream or returns an error.
@@ -338,7 +339,7 @@ impl<'b, R: ReadBytes> ReadBytes for &'b mut R {
         &mut self,
         pattern: &[u8],
         align: usize,
-        buf: &'a mut [u8]
+        buf: &'a mut [u8],
     ) -> io::Result<&'a mut [u8]> {
         (*self).scan_bytes_aligned(pattern, align, buf)
     }
@@ -351,6 +352,79 @@ impl<'b, R: ReadBytes> ReadBytes for &'b mut R {
     #[inline(always)]
     fn pos(&self) -> u64 {
         (**self).pos()
+    }
+}
+
+impl<'b, S: SeekBuffered> SeekBuffered for &'b mut S {
+    fn ensure_seekback_buffer(&mut self, len: usize) {
+        (*self).ensure_seekback_buffer(len)
+    }
+
+    fn unread_buffer_len(&self) -> usize {
+        (**self).unread_buffer_len()
+    }
+
+    fn read_buffer_len(&self) -> usize {
+        (**self).read_buffer_len()
+    }
+
+    fn seek_buffered(&mut self, pos: u64) -> u64 {
+        (*self).seek_buffered(pos)
+    }
+
+    fn seek_buffered_rel(&mut self, delta: isize) -> u64 {
+        (*self).seek_buffered_rel(delta)
+    }
+}
+
+/// `SeekBuffered` provides methods to seek within the buffered portion of a stream.
+pub trait SeekBuffered {
+    /// Ensures that `len` bytes will be available for backwards seeking if `len` bytes have been
+    /// previously read.
+    fn ensure_seekback_buffer(&mut self, len: usize);
+
+    /// Get the number of bytes buffered but not yet read.
+    ///
+    /// Note: This is the maximum number of bytes that can be seeked forwards within the buffer.
+    fn unread_buffer_len(&self) -> usize;
+
+    /// Gets the number of bytes buffered and read.
+    ///
+    /// Note: This is the maximum number of bytes that can be seeked backwards within the buffer.
+    fn read_buffer_len(&self) -> usize;
+
+    /// Seek within the buffered data to an absolute position in the stream. Returns the position
+    /// seeked to.
+    fn seek_buffered(&mut self, pos: u64) -> u64;
+
+    /// Seek within the buffered data relative to the current position in the stream. Returns the
+    /// position seeked to.
+    ///
+    /// The range of `delta` is clamped to the inclusive range defined by
+    /// `-read_buffer_len()..=unread_buffer_len()`.
+    fn seek_buffered_rel(&mut self, delta: isize) -> u64;
+
+    /// Seek backwards within the buffered data.
+    ///
+    /// This function is identical to [`SeekBuffered::seek_buffered_rel`] when a negative delta is
+    /// provided.
+    fn seek_buffered_rev(&mut self, delta: usize) {
+        assert!(delta < std::isize::MAX as usize);
+        self.seek_buffered_rel(-(delta as isize));
+    }
+}
+
+impl<'b, F: FiniteStream> FiniteStream for &'b mut F {
+    fn byte_len(&self) -> u64 {
+        (**self).byte_len()
+    }
+
+    fn bytes_read(&self) -> u64 {
+        (**self).bytes_read()
+    }
+
+    fn bytes_available(&self) -> u64 {
+        (**self).bytes_available()
     }
 }
 

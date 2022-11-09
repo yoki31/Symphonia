@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -29,9 +29,6 @@ impl Atom for MfhdAtom {
 
         let sequence_number = reader.read_be_u32()?;
 
-        Ok(MfhdAtom {
-            header,
-            sequence_number,
-        })
+        Ok(MfhdAtom { header, sequence_number })
     }
 }

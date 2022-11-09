@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -22,24 +22,27 @@
 //!
 //! The following container formats are supported.
 //!
-//! | Format   | Feature Flag | Default |
-//! |----------|--------------|---------|
-//! | ISO/MP4  | `isomp4`     | No      |
-//! | OGG      | `ogg`        | Yes     |
-//! | Wave     | `wav`        | Yes     |
+//! | Format   | Feature Flag | Gapless* | Default |
+//! |----------|--------------|----------|---------|
+//! | ISO/MP4  | `isomp4`     | No       | No      |
+//! | MKV/WebM | `mkv`        | No       | Yes     |
+//! | OGG      | `ogg`        | Yes      | Yes     |
+//! | Wave     | `wav`        | Yes      | Yes     |
+//!
+//! \* Gapless playback requires support from both the demuxer and decoder.
 //!
 //! ## Codecs
 //!
 //! The following codecs are supported.
 //!
-//! | Codec    | Feature Flag | Default |
-//! |----------|--------------|---------|
-//! | AAC-LC   | `aac`        | No      |
-//! | ALAC     | `alac`       | No      |
-//! | FLAC     | `flac`       | Yes     |
-//! | MP3      | `mp3`        | No      |
-//! | PCM      | `pcm`        | Yes     |
-//! | Vorbis   | `vorbis`     | Yes     |
+//! | Codec    | Feature Flag | Gapless | Default |
+//! |----------|--------------|---------|---------|
+//! | AAC-LC   | `aac`        | No      | No      |
+//! | ALAC     | `alac`       | Yes     | No      |
+//! | FLAC     | `flac`       | Yes     | Yes     |
+//! | MP3      | `mp3`        | Yes     | No      |
+//! | PCM      | `pcm`        | Yes     | Yes     |
+//! | Vorbis   | `vorbis`     | Yes     | Yes     |
 //!
 //! ## Metadata
 //!
@@ -71,7 +74,7 @@
 //! 5.  Using the `Probe`, call [`format`][core::probe::Probe::format] and pass it the
 //!    `MediaSourceStream`.
 //! 6.  If the probe successfully detects a compatible format, a `FormatReader` will be returned.
-//!     This is an instance of a demuxer that can read and demux the provided source into 
+//!     This is an instance of a demuxer that can read and demux the provided source into
 //!     [`Packet`][core::formats::Packet]s.
 //! 7.  At this point it is possible to interrogate the `FormatReader` for general information about
 //!     the media and metadata. Examine the [`Track`][core::formats::Track] listing using
@@ -94,7 +97,12 @@
 //! An example implementation of a simple audio player (symphonia-play) can be found in the
 //! Project Symphonia git repository.
 //!
-//! # Adding support for new formats and codecs
+//! # Gapless Playback
+//!
+//! Gapless playback is disabled by default. To enable gapless playback, set
+//! [`FormatOptions::enable_gapless`][core::formats::FormatOptions::enable_gapless] to `true`.
+//!
+//! # Adding new formats and codecs
 //!
 //! Simply implement the [`Decoder`][core::codecs::Decoder] trait for a decoder or the
 //! [`FormatReader`][core::formats::FormatReader] trait for a demuxer trait and register with
@@ -108,41 +116,45 @@ pub mod default {
     pub mod codecs {
         //! The `codecs` module re-exports all enabled Symphonia decoders.
 
-        #[cfg(feature = "aac")]
-        pub use symphonia_codec_aac::AacDecoder as AacDecoder;
-        #[cfg(feature = "alac")]
-        pub use symphonia_codec_alac::AlacDecoder as AlacDecoder;
         #[cfg(feature = "flac")]
-        pub use symphonia_bundle_flac::FlacDecoder as FlacDecoder;
+        pub use symphonia_bundle_flac::FlacDecoder;
         #[cfg(feature = "mp3")]
-        pub use symphonia_bundle_mp3::Mp3Decoder as Mp3Decoder;
+        pub use symphonia_bundle_mp3::Mp3Decoder;
+        #[cfg(feature = "aac")]
+        pub use symphonia_codec_aac::AacDecoder;
+        #[cfg(feature = "adpcm")]
+        pub use symphonia_codec_adpcm::AdpcmDecoder;
+        #[cfg(feature = "alac")]
+        pub use symphonia_codec_alac::AlacDecoder;
         #[cfg(feature = "pcm")]
-        pub use symphonia_codec_pcm::PcmDecoder as PcmDecoder;
+        pub use symphonia_codec_pcm::PcmDecoder;
         #[cfg(feature = "vorbis")]
-        pub use symphonia_codec_vorbis::VorbisDecoder as VorbisDecoder;
+        pub use symphonia_codec_vorbis::VorbisDecoder;
     }
 
     pub mod formats {
         //! The `formats` module re-exports all enabled Symphonia format readers.
 
-        #[cfg(feature = "aac")]
-        pub use symphonia_codec_aac::AdtsReader as AdtsReader;
         #[cfg(feature = "flac")]
-        pub use symphonia_bundle_flac::FlacReader as FlacReader;
-        #[cfg(feature = "isomp4")]
-        pub use symphonia_format_isomp4::IsoMp4Reader as IsoMp4Reader;
+        pub use symphonia_bundle_flac::FlacReader;
         #[cfg(feature = "mp3")]
-        pub use symphonia_bundle_mp3::Mp3Reader as Mp3Reader;
-        #[cfg(feature = "wav")]
-        pub use symphonia_format_wav::WavReader as WavReader;
+        pub use symphonia_bundle_mp3::Mp3Reader;
+        #[cfg(feature = "aac")]
+        pub use symphonia_codec_aac::AdtsReader;
+        #[cfg(feature = "isomp4")]
+        pub use symphonia_format_isomp4::IsoMp4Reader;
+        #[cfg(feature = "mkv")]
+        pub use symphonia_format_mkv::MkvReader;
         #[cfg(feature = "ogg")]
-        pub use symphonia_format_ogg::OggReader as OggReader;
+        pub use symphonia_format_ogg::OggReader;
+        #[cfg(feature = "wav")]
+        pub use symphonia_format_wav::WavReader;
     }
 
     use lazy_static::lazy_static;
 
-    use symphonia_core::probe::Probe;
     use symphonia_core::codecs::CodecRegistry;
+    use symphonia_core::probe::Probe;
 
     lazy_static! {
         static ref CODEC_REGISTRY: CodecRegistry = {
@@ -189,6 +201,9 @@ pub mod default {
         #[cfg(feature = "aac")]
         registry.register_all::<codecs::AacDecoder>();
 
+        #[cfg(feature = "adpcm")]
+        registry.register_all::<codecs::AdpcmDecoder>();
+
         #[cfg(feature = "alac")]
         registry.register_all::<codecs::AlacDecoder>();
 
@@ -231,6 +246,9 @@ pub mod default {
 
         #[cfg(feature = "ogg")]
         probe.register_all::<formats::OggReader>();
+
+        #[cfg(feature = "mkv")]
+        probe.register_all::<formats::MkvReader>();
 
         // Metadata
         probe.register_all::<Id3v2Reader>();

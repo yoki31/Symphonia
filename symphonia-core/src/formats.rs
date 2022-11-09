@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -19,16 +19,7 @@ pub mod prelude {
 
     pub use crate::units::{Duration, TimeBase, TimeStamp};
 
-    pub use super::{
-        Cue,
-        FormatOptions,
-        FormatReader,
-        Packet,
-        SeekedTo,
-        SeekMode,
-        SeekTo,
-        Track,
-    };
+    pub use super::{Cue, FormatOptions, FormatReader, Packet, SeekMode, SeekTo, SeekedTo, Track};
 }
 
 /// `SeekTo` specifies a position to seek to.
@@ -40,18 +31,19 @@ pub enum SeekTo {
         /// If `Some`, specifies which track's timestamp should be returned after the seek. If
         /// `None`, then the default track's timestamp is returned. If the container does not have
         /// a default track, then the first track's timestamp is returned.
-        track_id: Option<u32>
+        track_id: Option<u32>,
     },
     /// Seek to a track's `TimeStamp` in that track's timebase units.
     TimeStamp {
         /// The `TimeStamp` to seek to.
         ts: TimeStamp,
         /// Specifies which track `ts` is relative to.
-        track_id: u32
+        track_id: u32,
     },
 }
 
 /// `SeekedTo` is the result of a seek.
+#[derive(Copy, Clone, Debug)]
 pub struct SeekedTo {
     /// The track the seek was relative to.
     pub track_id: u32,
@@ -62,6 +54,7 @@ pub struct SeekedTo {
 }
 
 /// `SeekMode` selects the precision of a seek.
+#[derive(Copy, Clone, Debug)]
 pub enum SeekMode {
     /// Coarse seek mode is a best-effort attempt to seek to the requested position. The actual
     /// position seeked to may be before or after the requested position. Coarse seeking is an
@@ -74,7 +67,7 @@ pub enum SeekMode {
 }
 
 /// `FormatOptions` is a common set of options that all demuxers use.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct FormatOptions {
     /// If a `FormatReader` requires a seek index, but the container does not provide one, build the
     /// seek index during instantiation instead of building it progressively. Default: `false`.
@@ -87,6 +80,14 @@ pub struct FormatOptions {
     /// a good compromise for casual playback of music, podcasts, movies, etc. However, for
     /// highly-interactive applications, this value should be decreased.
     pub seek_index_fill_rate: u16,
+    /// Enable support for gapless playback. Default: `false`.
+    ///
+    /// When enabled, the reader will provide trim information in packets that may be used by
+    /// decoders to trim any encoder delay or padding.
+    ///
+    /// When enabled, this option will also alter the value and interpretation of timestamps and
+    /// durations such that they are relative to the non-trimmed region.
+    pub enable_gapless: bool,
 }
 
 impl Default for FormatOptions {
@@ -94,6 +95,7 @@ impl Default for FormatOptions {
         FormatOptions {
             prebuild_seek_index: false,
             seek_index_fill_rate: 20,
+            enable_gapless: false,
         }
     }
 }
@@ -104,6 +106,7 @@ impl Default for FormatOptions {
 /// depending on the source media. A `Cue`'s duration is the difference between the `Cue`'s
 /// timestamp and the next. Each `Cue` may contain an optional index of points relative to the `Cue`
 /// that never exceed the timestamp of the next `Cue`. A `Cue` may also have associated `Tag`s.
+#[derive(Clone, Debug)]
 pub struct Cue {
     /// A unique index for the `Cue`.
     pub index: u32,
@@ -120,6 +123,7 @@ pub struct Cue {
 ///
 /// A `CuePoint` provides more precise indexing within a parent `Cue`. Additional `Tag`s may be
 /// associated with a `CuePoint`.
+#[derive(Clone, Debug)]
 pub struct CuePoint {
     /// The offset of the first frame in the `CuePoint` relative to the start of the parent `Cue`.
     pub start_offset_ts: u64,
@@ -129,6 +133,7 @@ pub struct CuePoint {
 
 /// A `Track` is an independently coded media bitstream. A media format may contain multiple tracks
 /// in one container. Each of those tracks are represented by one `Track`.
+#[derive(Clone, Debug)]
 pub struct Track {
     /// A unique identifier for the track.
     pub id: u32,
@@ -140,11 +145,7 @@ pub struct Track {
 
 impl Track {
     pub fn new(id: u32, codec_params: CodecParameters) -> Self {
-        Track {
-            id,
-            codec_params,
-            language: None,
-        }
+        Track { id, codec_params, language: None }
     }
 }
 
@@ -164,7 +165,7 @@ impl Track {
 /// `FormatReader` provides an Iterator-like interface over packets for easy consumption and
 /// filtering. Seeking will invalidate the state of any `Decoder` processing packets from the
 /// `FormatReader` and should be reset after a successful seek operation.
-pub trait FormatReader: Send {
+pub trait FormatReader: Send + Sync {
     /// Attempt to instantiate a `FormatReader` using the provided `FormatOptions` and
     /// `MediaSourceStream`. The reader will probe the container to verify format support, determine
     /// the number of tracks, and read any initial metadata.
@@ -181,50 +182,97 @@ pub trait FormatReader: Send {
     /// Seek, as precisely as possible depending on the mode, to the `Time` or track `TimeStamp`
     /// requested. Returns the requested and actual `TimeStamps` seeked to, as well as the `Track`.
     ///
-    /// Note: The `FormatReader` by itself cannot seek to an exact audio frame, it is only capable of
-    /// seeking to the nearest `Packet`. Therefore, to seek to an exact frame, a `Decoder` must
+    /// After a seek, all `Decoder`s consuming packets from this reader should be reset.
+    ///
+    /// Note: The `FormatReader` by itself cannot seek to an exact audio frame, it is only capable
+    /// of seeking to the nearest `Packet`. Therefore, to seek to an exact frame, a `Decoder` must
     /// decode packets until the requested position is reached. When using the accurate `SeekMode`,
-    /// the seeked position will always be before the requested position. If the coarse `SeekMode` is
-    /// used, then the seek position may be after the requested position. Coarse seeking is an
-    /// optional performance enhancement, therefore, a coarse seek may sometimes be an accurate seek.
+    /// the seeked position will always be before the requested position. If the coarse `SeekMode`
+    /// is used, then the seek position may be after the requested position. Coarse seeking is an
+    /// optional performance enhancement, therefore, a coarse seek may sometimes be an accurate
+    /// seek.
     fn seek(&mut self, mode: SeekMode, to: SeekTo) -> Result<SeekedTo>;
 
     /// Gets a list of tracks in the container.
     fn tracks(&self) -> &[Track];
 
-    /// Gets the default track. If the `FormatReader` has a method of determing the default track,
+    /// Gets the default track. If the `FormatReader` has a method of determining the default track,
     /// this function should return it. Otherwise, the first track is returned. If no tracks are
-    /// present then None is returned.
+    /// present then `None` is returned.
     fn default_track(&self) -> Option<&Track> {
         self.tracks().first()
     }
 
     /// Get the next packet from the container.
+    ///
+    /// If `ResetRequired` is returned, then the track list must be re-examined and all `Decoder`s
+    /// re-created. All other errors are unrecoverable.
     fn next_packet(&mut self) -> Result<Packet>;
 
-    /// Destroys the `FormatReader` and returns the underlying stream
+    /// Destroys the `FormatReader` and returns the underlying media source stream
     fn into_inner(self: Box<Self>) -> MediaSourceStream;
 }
 
 /// A `Packet` contains a discrete amount of encoded data for a single codec bitstream. The exact
 /// amount of data is bounded, but not defined, and is dependant on the container and/or the
 /// encapsulated codec.
+#[derive(Clone)]
 pub struct Packet {
+    /// The track id.
     track_id: u32,
-    pts: u64,
-    dur: u64,
-    data: Box<[u8]>,
+    /// The timestamp of the packet. When gapless support is enabled, this timestamp is relative to
+    /// the end of the encoder delay.
+    ///
+    /// This timestamp is in `TimeBase` units.
+    pub ts: u64,
+    /// The duration of the packet. When gapless support is enabled, the duration does not include
+    /// the encoder delay or padding.
+    ///
+    /// The duration is in `TimeBase` units.
+    pub dur: u64,
+    /// When gapless support is enabled, this is the number of decoded frames that should be trimmed
+    /// from the start of the packet to remove the encoder delay. Must be 0 in all other cases.
+    pub trim_start: u32,
+    /// When gapless support is enabled, this is the number of decoded frames that should be trimmed
+    /// from the end of the packet to remove the encoder padding. Must be 0 in all other cases.
+    pub trim_end: u32,
+    /// The packet buffer.
+    pub data: Box<[u8]>,
 }
 
 impl Packet {
     /// Create a new `Packet` from a slice.
-    pub fn new_from_slice(track_id: u32, pts: u64, dur: u64, buf: &[u8]) -> Self {
-        Packet { track_id, pts, dur, data: Box::from(buf) }
+    pub fn new_from_slice(track_id: u32, ts: u64, dur: u64, buf: &[u8]) -> Self {
+        Packet { track_id, ts, dur, trim_start: 0, trim_end: 0, data: Box::from(buf) }
     }
 
     /// Create a new `Packet` from a boxed slice.
-    pub fn new_from_boxed_slice(track_id: u32, pts: u64, dur: u64, data: Box<[u8]>) -> Self {
-        Packet { track_id, pts, dur, data }
+    pub fn new_from_boxed_slice(track_id: u32, ts: u64, dur: u64, data: Box<[u8]>) -> Self {
+        Packet { track_id, ts, dur, trim_start: 0, trim_end: 0, data }
+    }
+
+    /// Create a new `Packet` with trimming information from a slice.
+    pub fn new_trimmed_from_slice(
+        track_id: u32,
+        ts: u64,
+        dur: u64,
+        trim_start: u32,
+        trim_end: u32,
+        buf: &[u8],
+    ) -> Self {
+        Packet { track_id, ts, dur, trim_start, trim_end, data: Box::from(buf) }
+    }
+
+    /// Create a new `Packet` with trimming information from a boxed slice.
+    pub fn new_trimmed_from_boxed_slice(
+        track_id: u32,
+        ts: u64,
+        dur: u64,
+        trim_start: u32,
+        trim_end: u32,
+        data: Box<[u8]>,
+    ) -> Self {
+        Packet { track_id, ts, dur, trim_start, trim_end, data }
     }
 
     /// The track identifier of the track this packet belongs to.
@@ -232,17 +280,40 @@ impl Packet {
         self.track_id
     }
 
-    /// Get the presentation timestamp of the packet in `TimeBase` units. May be 0 if unknown.
-    pub fn pts(&self) -> u64 {
-        self.pts
+    /// Get the timestamp of the packet in `TimeBase` units.
+    ///
+    /// If gapless support is enabled, then this timestamp is relative to the end of the encoder
+    /// delay.
+    pub fn ts(&self) -> u64 {
+        self.ts
     }
 
-    /// Get the duration of the packet in `TimeBase` units. May be 0 if unknown.
-    pub fn duration(&self) -> u64 {
+    /// Get the duration of the packet in `TimeBase` units.
+    ///
+    /// If gapless support is enabled, then this is the duration after the encoder delay and padding
+    /// is trimmed.
+    pub fn dur(&self) -> u64 {
         self.dur
     }
 
-    /// Get the packet buffer as an immutable slice.
+    /// Get the duration of the packet in `TimeBase` units if no decoded frames are trimmed.
+    ///
+    /// If gapless support is disabled, then this is the same as the duration.
+    pub fn block_dur(&self) -> u64 {
+        self.dur + u64::from(self.trim_start) + u64::from(self.trim_end)
+    }
+
+    /// Get the number of frames to trim from the start of the decoded packet.
+    pub fn trim_start(&self) -> u32 {
+        self.trim_start
+    }
+
+    /// Get the number of frames to trim from the end of the decoded packet.
+    pub fn trim_end(&self) -> u32 {
+        self.trim_end
+    }
+
+    /// Get an immutable slice to the packet buffer.
     pub fn buf(&self) -> &[u8] {
         &self.data
     }
@@ -255,6 +326,8 @@ impl Packet {
 
 pub mod util {
     //! Helper utilities for implementing `FormatReader`s.
+
+    use super::Packet;
 
     /// A `SeekPoint` is a mapping between a sample or frame number to byte offset within a media
     /// stream.
@@ -288,7 +361,7 @@ pub mod util {
     /// `SeekSearchResult` is the return value for a search on a `SeekIndex`. It returns a range of
     /// `SeekPoint`s a `FormatReader` should search to find the desired timestamp. Ranges are
     /// lower-bound inclusive, and upper-bound exclusive.
-    #[derive(Debug, PartialEq)]
+    #[derive(Copy, Clone, Debug, PartialEq)]
     pub enum SeekSearchResult {
         /// The `SeekIndex` is empty so the desired timestamp could not be found. The entire stream
         /// should be searched for the desired timestamp.
@@ -304,15 +377,13 @@ pub mod util {
         /// The desired timestamp can be found within the range. The stream should be searched for
         /// the desired starting at the first `SeekPoint` up-to, but not-including, the second
         /// `SeekPoint`.
-        Range(SeekPoint, SeekPoint)
+        Range(SeekPoint, SeekPoint),
     }
 
     impl SeekIndex {
         /// Create an empty `SeekIndex`
         pub fn new() -> SeekIndex {
-            SeekIndex {
-                points: Vec::new(),
-            }
+            SeekIndex { points: Vec::new() }
         }
 
         /// Insert a `SeekPoint` into the index.
@@ -335,9 +406,8 @@ pub mod util {
                 // TODO: Use when Rust 1.52 is stable.
                 // let i = self.points.partition_point(|p| p.frame_ts < ts);
 
-                let i = self.points.iter()
-                                   .position(|p| p.frame_ts > ts)
-                                   .unwrap_or(self.points.len());
+                let i =
+                    self.points.iter().position(|p| p.frame_ts > ts).unwrap_or(self.points.len());
 
                 self.points.insert(i, seek_point);
             }
@@ -386,6 +456,32 @@ pub mod util {
         }
     }
 
+    /// Given a `Packet`, the encoder delay in frames, and the number of non-delay or padding
+    /// frames, adjust the packet's timestamp and duration, and populate the trim information.
+    pub fn trim_packet(packet: &mut Packet, delay: u32, num_frames: Option<u64>) {
+        packet.trim_start = if packet.ts < u64::from(delay) {
+            let trim = (u64::from(delay) - packet.ts).min(packet.dur);
+            packet.ts = 0;
+            packet.dur -= trim;
+            trim as u32
+        }
+        else {
+            packet.ts -= u64::from(delay);
+            0
+        };
+
+        if let Some(num_frames) = num_frames {
+            packet.trim_end = if packet.ts + packet.dur > num_frames {
+                let trim = (packet.ts + packet.dur - num_frames).min(packet.dur);
+                packet.dur -= trim;
+                trim as u32
+            }
+            else {
+                0
+            };
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::{SeekIndex, SeekPoint, SeekSearchResult};
@@ -393,31 +489,27 @@ pub mod util {
         #[test]
         fn verify_seek_index_search() {
             let mut index = SeekIndex::new();
-            index.insert(50 , 0,  45);
-            index.insert(120, 0,   4);
+            index.insert(50, 0, 45);
+            index.insert(120, 0, 4);
             index.insert(320, 0, 100);
-            index.insert(421, 0,  10);
-            index.insert(500, 0,  12);
-            index.insert(600, 0,  12);
+            index.insert(421, 0, 10);
+            index.insert(500, 0, 12);
+            index.insert(600, 0, 12);
 
-            assert_eq!(index.search(25) , SeekSearchResult::Upper(SeekPoint::new(50 ,0, 45)));
-            assert_eq!(index.search(700), SeekSearchResult::Lower(SeekPoint::new(600,0, 12)));
+            assert_eq!(index.search(25), SeekSearchResult::Upper(SeekPoint::new(50, 0, 45)));
+            assert_eq!(index.search(700), SeekSearchResult::Lower(SeekPoint::new(600, 0, 12)));
             assert_eq!(
                 index.search(110),
-                SeekSearchResult::Range(SeekPoint::new(50 ,0, 45),
-                SeekPoint::new(120,0,4))
+                SeekSearchResult::Range(SeekPoint::new(50, 0, 45), SeekPoint::new(120, 0, 4))
             );
             assert_eq!(
                 index.search(340),
-                SeekSearchResult::Range(SeekPoint::new(320,0,100),
-                SeekPoint::new(421,0,10))
+                SeekSearchResult::Range(SeekPoint::new(320, 0, 100), SeekPoint::new(421, 0, 10))
             );
             assert_eq!(
                 index.search(320),
-                SeekSearchResult::Range(SeekPoint::new(320,0,100),
-                SeekPoint::new(421,0,10))
+                SeekSearchResult::Range(SeekPoint::new(320, 0, 100), SeekPoint::new(421, 0, 10))
             );
         }
     }
-
 }

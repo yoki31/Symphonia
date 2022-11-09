@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -35,9 +35,6 @@ impl Atom for Co64Atom {
             chunk_offsets.push(reader.read_be_u64()?);
         }
 
-        Ok(Co64Atom {
-            header,
-            chunk_offsets,
-        })
+        Ok(Co64Atom { header, chunk_offsets })
     }
 }

@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -69,7 +69,7 @@ pub struct MetadataOptions {
 ///
 /// The visual types listed here are derived from, though do not entirely cover, the ID3v2 APIC
 /// frame specification.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum StandardVisualKey {
     FileIcon,
     OtherIcon,
@@ -95,7 +95,7 @@ pub enum StandardVisualKey {
 /// `StandardTagKey` is an enumeration providing standardized keys for common tag types.
 /// A tag reader may assign a `StandardTagKey` to a `Tag` if the tag's key is generally
 /// accepted to map to a specific usage.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum StandardTagKey {
     AcoustidFingerprint,
     AcoustidId,
@@ -248,11 +248,11 @@ impl_from_for_value!(v, &[u8], Value::Binary(Box::from(v)));
 impl_from_for_value!(v, bool, Value::Boolean(v));
 impl_from_for_value!(v, f32, Value::Float(f64::from(v)));
 impl_from_for_value!(v, f64, Value::Float(v));
-impl_from_for_value!(v, i8 , Value::SignedInt(i64::from(v)));
+impl_from_for_value!(v, i8, Value::SignedInt(i64::from(v)));
 impl_from_for_value!(v, i16, Value::SignedInt(i64::from(v)));
 impl_from_for_value!(v, i32, Value::SignedInt(i64::from(v)));
 impl_from_for_value!(v, i64, Value::SignedInt(v));
-impl_from_for_value!(v, u8 , Value::UnsignedInt(u64::from(v)));
+impl_from_for_value!(v, u8, Value::UnsignedInt(u64::from(v)));
 impl_from_for_value!(v, u16, Value::UnsignedInt(u64::from(v)));
 impl_from_for_value!(v, u32, Value::UnsignedInt(u64::from(v)));
 impl_from_for_value!(v, u64, Value::UnsignedInt(v));
@@ -267,8 +267,8 @@ fn buffer_to_hex_string(buf: &[u8]) -> String {
         let u = (ch & 0xf0) >> 4;
         let l = ch & 0x0f;
         output.push_str("\\0x");
-        output.push(if u < 10 { (b'0' + u) as char } else { (b'a' + u - 10) as char});
-        output.push(if l < 10 { (b'0' + l) as char } else { (b'a' + l - 10) as char});
+        output.push(if u < 10 { (b'0' + u) as char } else { (b'a' + u - 10) as char });
+        output.push(if l < 10 { (b'0' + l) as char } else { (b'a' + l - 10) as char });
     }
 
     output
@@ -310,11 +310,7 @@ pub struct Tag {
 impl Tag {
     /// Create a new `Tag`.
     pub fn new(std_key: Option<StandardTagKey>, key: &str, value: Value) -> Tag {
-        Tag {
-            std_key,
-            key: key.to_string(),
-            value,
-        }
+        Tag { std_key, key: key.to_string(), value }
     }
 
     /// Returns true if the `Tag`'s key string was recognized and a `StandardTagKey` was assigned,
@@ -328,13 +324,7 @@ impl fmt::Display for Tag {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.std_key {
             Some(ref std_key) => {
-                write!(
-                    f,
-                    "{{ std_key={:?}, key=\"{}\", value={} }}",
-                    std_key,
-                    self.key,
-                    self.value
-                )
+                write!(f, "{{ std_key={:?}, key=\"{}\", value={} }}", std_key, self.key, self.value)
             }
             None => write!(f, "{{ key=\"{}\", value={} }}", self.key, self.value),
         }
@@ -342,7 +332,7 @@ impl fmt::Display for Tag {
 }
 
 /// A 2 dimensional (width and height) size type.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct Size {
     /// The width in pixels.
     pub width: u32,
@@ -432,9 +422,7 @@ pub struct MetadataBuilder {
 impl MetadataBuilder {
     /// Instantiate a new `MetadataBuilder`.
     pub fn new() -> Self {
-        MetadataBuilder {
-            metadata: Default::default(),
-        }
+        MetadataBuilder { metadata: Default::default() }
     }
 
     /// Add a `Tag` to the metadata.
@@ -478,6 +466,16 @@ impl<'a> Metadata<'a> {
         self.revisions.front()
     }
 
+    /// Skips to, and gets an immutable reference to the latest, and therefore newest, revision of the metadata.
+    pub fn skip_to_latest(&mut self) -> Option<&MetadataRevision> {
+        loop {
+            if self.pop().is_none() {
+                break;
+            }
+        }
+        self.current()
+    }
+
     /// If there are newer `Metadata` revisions, advances the `MetadataLog` by discarding the
     /// current revision and replacing it with the next revision, returning the discarded
     /// `Metadata`. When there are no newer revisions, `None` is returned. As such, `pop` will never
@@ -510,7 +508,7 @@ impl MetadataLog {
     }
 }
 
-pub trait MetadataReader: Send {
+pub trait MetadataReader: Send + Sync {
     /// Instantiates the `MetadataReader` with the provided `MetadataOptions`.
     fn new(options: &MetadataOptions) -> Self
     where

@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -7,13 +7,13 @@
 
 //! An ID3v2 metadata reader.
 
-use symphonia_core::support_metadata;
-use symphonia_core::errors::{Result, decode_error, unsupported_error};
+use symphonia_core::errors::{decode_error, unsupported_error, Result};
 use symphonia_core::io::*;
-use symphonia_core::meta::{MetadataRevision, MetadataBuilder, MetadataOptions, MetadataReader};
-use symphonia_core::probe::{QueryDescriptor, Descriptor, Instantiate};
+use symphonia_core::meta::{MetadataBuilder, MetadataOptions, MetadataReader, MetadataRevision};
+use symphonia_core::probe::{Descriptor, Instantiate, QueryDescriptor};
+use symphonia_core::support_metadata;
 
-use log::{info, trace};
+use log::{info, trace, warn};
 
 mod frames;
 mod unsync;
@@ -59,6 +59,7 @@ enum ImageSizeRestriction {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct Header {
     major_version: u8,
     minor_version: u8,
@@ -70,6 +71,7 @@ struct Header {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct Restrictions {
     tag_size: TagSizeRestriction,
     text_encoding: TextEncodingRestriction,
@@ -79,6 +81,7 @@ struct Restrictions {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct ExtendedHeader {
     /// ID3v2.3 only, the number of padding bytes.
     padding_size: Option<u32>,
@@ -113,20 +116,20 @@ fn read_id3v2_header<B: ReadBytes>(reader: &mut B) -> Result<Header> {
         has_footer: false,
     };
 
-    // Major and minor version numbers should never equal 0xff as per the specification. 
+    // Major and minor version numbers should never equal 0xff as per the specification.
     if major_version == 0xff || minor_version == 0xff {
         return decode_error("id3v2: invalid version number(s)");
     }
 
-    // Only support versions 2.2.x (first version) to 2.4.x (latest version as of May 2019) of the 
+    // Only support versions 2.2.x (first version) to 2.4.x (latest version as of May 2019) of the
     // specification.
     if major_version < 2 || major_version > 4 {
         return unsupported_error("id3v2: unsupported ID3v2 version");
     }
 
-    // Version 2.2 of the standard specifies a compression flag bit, but does not specify a 
-    // compression standard. Future versions of the standard remove this feature and repurpose this 
-    // bit for other features. Since there is no way to know how to handle the remaining tag data, 
+    // Version 2.2 of the standard specifies a compression flag bit, but does not specify a
+    // compression standard. Future versions of the standard remove this feature and repurpose this
+    // bit for other features. Since there is no way to know how to handle the remaining tag data,
     // return an unsupported error.
     if major_version == 2 && (flags & 0x40) != 0 {
         return unsupported_error("id3v2: ID3v2.2 compression is not supported");
@@ -178,7 +181,7 @@ fn read_id3v2p3_extended_header<B: ReadBytes>(reader: &mut B) -> Result<Extended
 /// Read the extended header of an ID3v2.4 tag.
 fn read_id3v2p4_extended_header<B: ReadBytes>(reader: &mut B) -> Result<ExtendedHeader> {
     let _size = read_syncsafe_leq32(reader, 28)?;
-    
+
     if reader.read_u8()? != 1 {
         return decode_error("id3v2: extended flags should have a length of 1");
     }
@@ -270,32 +273,32 @@ fn read_id3v2p4_extended_header<B: ReadBytes>(reader: &mut B) -> Result<Extended
 }
 
 fn read_id3v2_body<B: ReadBytes + FiniteStream>(
-    mut reader: B,
+    reader: &mut B,
     header: &Header,
     metadata: &mut MetadataBuilder,
 ) -> Result<()> {
     // If there is an extended header, read and parse it based on the major version of the tag.
     if header.has_extended_header {
         let extended = match header.major_version {
-            3 => read_id3v2p3_extended_header(&mut reader)?,
-            4 => read_id3v2p4_extended_header(&mut reader)?,
+            3 => read_id3v2p3_extended_header(reader)?,
+            4 => read_id3v2p4_extended_header(reader)?,
             _ => unreachable!(),
         };
         trace!("{:#?}", &extended);
     }
 
     let min_frame_size = match header.major_version {
-        2     => 6,
+        2 => 6,
         3 | 4 => 10,
-        _     => unreachable!(),
+        _ => unreachable!(),
     };
 
     loop {
         // Read frames based on the major version of the tag.
         let frame = match header.major_version {
-            2 => read_id3v2p2_frame(&mut reader),
-            3 => read_id3v2p3_frame(&mut reader),
-            4 => read_id3v2p4_frame(&mut reader),
+            2 => read_id3v2p2_frame(reader),
+            3 => read_id3v2p3_frame(reader),
+            4 => read_id3v2p4_frame(reader),
             _ => break,
         }?;
 
@@ -305,19 +308,25 @@ fn read_id3v2_body<B: ReadBytes + FiniteStream>(
             // A frame was parsed into a tag, add it to the tag collection.
             FrameResult::Tag(tag) => {
                 metadata.add_tag(tag);
-            },
+            }
             // A frame was parsed into multiple tags, add them all to the tag collection.
             FrameResult::MultipleTags(multi_tags) => {
-                for tag in multi_tags { metadata.add_tag(tag); }
-            },
+                for tag in multi_tags {
+                    metadata.add_tag(tag);
+                }
+            }
             // A frame was parsed into a visual, add it to the visual collection.
             FrameResult::Visual(visual) => {
                 metadata.add_visual(visual);
-            },
-            // An unknown frame was encountered, just ignore it.
+            }
+            // An unknown frame was encountered.
             FrameResult::UnsupportedFrame(ref id) => {
-                info!("Unsupported frame {}.", id);
-            },
+                info!("unsupported frame {}", id);
+            }
+            // The frame contained invalid data.
+            FrameResult::InvalidData(ref id) => {
+                warn!("invalid data for {} frame", id);
+            }
         }
 
         // Read frames until there is not enough bytes available in the ID3v2 tag for another frame.
@@ -333,21 +342,29 @@ pub fn read_id3v2<B: ReadBytes>(reader: &mut B, metadata: &mut MetadataBuilder) 
     // Read the (sorta) version agnostic tag header.
     let header = read_id3v2_header(reader)?;
 
-    // The header specified the byte length of the contents of the ID3v2 tag (excluding the header),
-    // use a scoped reader to ensure we don't exceed that length, and to determine if there are no 
-    // more frames left to parse.
-    let scoped = ScopedStream::new(reader, u64::from(header.size));
-
-    // If the unsynchronisation flag is set in the header, all tag data must be passed through the 
+    // If the unsynchronisation flag is set in the header, all tag data must be passed through the
     // unsynchronisation decoder before being read for verions < 4 of ID3v2.
-    if header.unsynchronisation && header.major_version < 4 {
-        read_id3v2_body(UnsyncStream::new(scoped), &header, metadata)
+    let mut scoped = if header.unsynchronisation && header.major_version < 4 {
+        let mut unsync = UnsyncStream::new(ScopedStream::new(reader, u64::from(header.size)));
+
+        read_id3v2_body(&mut unsync, &header, metadata)?;
+
+        unsync.into_inner()
     }
-    // Otherwise, read the data as-is. Individual frames may be unsynchronised for major versions 
+    // Otherwise, read the data as-is. Individual frames may be unsynchronised for major versions
     // >= 4.
     else {
-        read_id3v2_body(scoped, &header, metadata)
-    }
+        let mut scoped = ScopedStream::new(reader, u64::from(header.size));
+
+        read_id3v2_body(&mut scoped, &header, metadata)?;
+
+        scoped
+    };
+
+    // Ignore any remaining data in the tag.
+    scoped.ignore()?;
+
+    Ok(())
 }
 
 pub mod util {
@@ -378,14 +395,13 @@ pub mod util {
             _ => None,
         }
     }
-
 }
 
 pub struct Id3v2Reader;
 
 impl QueryDescriptor for Id3v2Reader {
     fn query() -> &'static [Descriptor] {
-        &[ support_metadata!("id3v2", "ID3v2", &[], &[], &[ b"ID3" ]) ]
+        &[support_metadata!("id3v2", "ID3v2", &[], &[], &[b"ID3"])]
     }
 
     fn score(_context: &[u8]) -> u8 {
@@ -395,7 +411,7 @@ impl QueryDescriptor for Id3v2Reader {
 
 impl MetadataReader for Id3v2Reader {
     fn new(_options: &MetadataOptions) -> Self {
-        Id3v2Reader { }
+        Id3v2Reader {}
     }
 
     fn read_all(&mut self, reader: &mut MediaSourceStream) -> Result<MetadataRevision> {

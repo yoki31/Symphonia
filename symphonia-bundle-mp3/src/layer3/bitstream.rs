@@ -1,11 +1,11 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use symphonia_core::errors::{Result, decode_error};
+use symphonia_core::errors::{decode_error, Result};
 use symphonia_core::io::ReadBitsLtr;
 
 use super::{FrameData, Granule, GranuleChannel};
@@ -17,10 +17,23 @@ use crate::common::*;
 /// N, is determined by block type.
 ///
 /// This table is indexed by scalefac_compress.
-static SCALE_FACTOR_SLEN: [(u32, u32); 16] =
-[
-    (0, 0), (0, 1), (0, 2), (0, 3), (3, 0), (1, 1), (1, 2), (1, 3),
-    (2, 1), (2, 2), (2, 3), (3, 1), (3, 2), (3, 3), (4, 2), (4, 3),
+static SCALE_FACTOR_SLEN: [(u32, u32); 16] = [
+    (0, 0),
+    (0, 1),
+    (0, 2),
+    (0, 3),
+    (3, 0),
+    (1, 1),
+    (1, 2),
+    (1, 3),
+    (2, 1),
+    (2, 2),
+    (2, 3),
+    (3, 1),
+    (3, 2),
+    (3, 3),
+    (4, 2),
+    (4, 3),
 ];
 
 /// For MPEG version 2, each scale factor band has a different scale factor. The length in bits of
@@ -30,13 +43,13 @@ static SCALE_FACTOR_SLEN: [(u32, u32); 16] =
 /// This table is indexed by channel_mode, scalefac_compress, and block_type.
 const SCALE_FACTOR_MPEG2_NSFB: [[[usize; 4]; 3]; 6] = [
     // Intensity stereo channel modes.
-    [[ 7,  7, 7, 0], [12, 12, 12, 0], [ 6, 15, 12, 0]],
-    [[ 6,  6, 6, 3], [12,  9,  9, 6], [ 6, 12,  9, 6]],
-    [[ 8,  8, 5, 0], [15, 12,  9, 0], [ 6, 18,  9, 0]],
+    [[7, 7, 7, 0], [12, 12, 12, 0], [6, 15, 12, 0]],
+    [[6, 6, 6, 3], [12, 9, 9, 6], [6, 12, 9, 6]],
+    [[8, 8, 5, 0], [15, 12, 9, 0], [6, 18, 9, 0]],
     // Other channel modes.
-    [[ 6,  5, 5, 5], [ 9,  9,  9, 9], [ 6,  9,  9, 9]],
-    [[ 6,  5, 7, 3], [ 9,  9, 12, 6], [ 6,  9, 12, 6]],
-    [[11, 10, 0, 0], [18, 18,  0, 0], [15, 18,  0, 0]],
+    [[6, 5, 5, 5], [9, 9, 9, 9], [6, 9, 9, 9]],
+    [[6, 5, 7, 3], [9, 9, 12, 6], [6, 9, 12, 6]],
+    [[11, 10, 0, 0], [18, 18, 0, 0], [15, 18, 0, 0]],
 ];
 
 /// Reads the side_info for a single channel in a granule from a `BitStream`.
@@ -45,7 +58,6 @@ fn read_granule_channel_side_info<B: ReadBitsLtr>(
     channel: &mut GranuleChannel,
     header: &FrameHeader,
 ) -> Result<()> {
-
     channel.part2_3_length = bs.read_bits_leq32(12)? as u16;
     channel.big_values = bs.read_bits_leq32(9)? as u16;
 
@@ -57,12 +69,8 @@ fn read_granule_channel_side_info<B: ReadBitsLtr>(
 
     channel.global_gain = bs.read_bits_leq32(8)? as u8;
 
-    channel.scalefac_compress = if header.is_mpeg1() {
-        bs.read_bits_leq32(4)
-    }
-    else {
-        bs.read_bits_leq32(9)
-    }? as u16;
+    channel.scalefac_compress =
+        if header.is_mpeg1() { bs.read_bits_leq32(4) } else { bs.read_bits_leq32(9) }? as u16;
 
     let window_switching = bs.read_bool()?;
 
@@ -77,7 +85,7 @@ fn read_granule_channel_side_info<B: ReadBitsLtr>(
             0b01 => BlockType::Start,
             0b10 => BlockType::Short { is_mixed },
             0b11 => BlockType::End,
-            _    => unreachable!(),
+            _ => unreachable!(),
         };
 
         // When window switching is used, there are only two regions, therefore there are only
@@ -101,7 +109,7 @@ fn read_granule_channel_side_info<B: ReadBitsLtr>(
             // added here to both values.
             let region0_count = match channel.block_type {
                 BlockType::Short { is_mixed: false } => 5 + 1,
-                _                                    => 7 + 1,
+                _ => 7 + 1,
             };
 
             channel.region1_start = SFB_LONG_BANDS[header.sample_rate_idx][region0_count];
@@ -109,8 +117,8 @@ fn read_granule_channel_side_info<B: ReadBitsLtr>(
         // If MPEG version 1, OR the block type is Short...
         else if header.is_mpeg1() || block_type_enc == 0b10 {
             // For MPEG1 with transitional LONG blocks, the first 8 LONG scale-factor bands are used
-            // for region0. These bands are always [4, 4, 4, 4, 4, 4, 6, 6, ...] regardless of sample
-            // rate. These bands sum to 36 samples.
+            // for region0. These bands are always [4, 4, 4, 4, 4, 4, 6, 6, ...] regardless of
+            // sample rate. These bands sum to 36 samples.
             //
             // For MPEG1 with SHORT blocks, the first 9 SHORT scale-factor bands are used for
             // region0. These band are always [4, 4, 4, 4, 4, 4, 4, 4, 4, ...] regardless of sample
@@ -121,6 +129,8 @@ fn read_granule_channel_side_info<B: ReadBitsLtr>(
             // of sample and thus sum to 36 samples.
             //
             // In all cases, the region0_count is 36.
+            //
+            // TODO: This is not accurate for MPEG2.5 at 8kHz.
             channel.region1_start = 36;
         }
         // If MPEG version 2 AND the block type is not Short...
@@ -146,7 +156,7 @@ fn read_granule_channel_side_info<B: ReadBitsLtr>(
         // When window switching is not used, only LONG scale-factor bands are used for each region.
         // The number of bands in region0 and region1 are defined in side_info. The stored value is
         // 1 less than the actual value.
-        let region0_count   = bs.read_bits_leq32(4)? as usize + 1;
+        let region0_count = bs.read_bits_leq32(4)? as usize + 1;
         let region0_1_count = bs.read_bits_leq32(3)? as usize + region0_count + 1;
 
         channel.region1_start = SFB_LONG_BANDS[header.sample_rate_idx][region0_count];
@@ -155,17 +165,12 @@ fn read_granule_channel_side_info<B: ReadBitsLtr>(
         // Protect against this.
         channel.region2_start = match region0_1_count {
             0..=22 => SFB_LONG_BANDS[header.sample_rate_idx][region0_1_count],
-            _      => 576,
+            _ => 576,
         };
     }
 
-    channel.preflag = if header.is_mpeg1() {
-        bs.read_bool()?
-    }
-    else {
-        // Pre-flag is determined implicitly for MPEG2: ISO/IEC 13818-3 section 2.4.3.4.
-        channel.scalefac_compress >= 500
-    };
+    // For MPEG2, preflag is determined implicitly when reading the scale factors.
+    channel.preflag = if header.is_mpeg1() { bs.read_bool()? } else { false };
 
     channel.scalefac_scale = bs.read_bool()?;
     channel.count1table_select = if bs.read_bool()? { 1 } else { 0 };
@@ -190,18 +195,17 @@ fn read_granule_side_info<B: ReadBitsLtr>(
 pub(super) fn read_side_info<B: ReadBitsLtr>(
     bs: &mut B,
     header: &FrameHeader,
-    frame_data: &mut FrameData
+    frame_data: &mut FrameData,
 ) -> Result<usize> {
-
     // For MPEG version 1...
-    let side_info_len = if header.is_mpeg1() {
+    if header.is_mpeg1() {
         // First 9 bits is main_data_begin.
         frame_data.main_data_begin = bs.read_bits_leq32(9)? as u16;
 
         // Next 3 (>1 channel) or 5 (1 channel) bits are private and should be ignored.
         match header.channel_mode {
             ChannelMode::Mono => bs.ignore_bits(5)?,
-            _                 => bs.ignore_bits(3)?,
+            _ => bs.ignore_bits(3)?,
         };
 
         // Next four (or 8, if more than one channel) are the SCFSI bits.
@@ -209,12 +213,6 @@ pub(super) fn read_side_info<B: ReadBitsLtr>(
             for band in scfsi.iter_mut() {
                 *band = bs.read_bool()?;
             }
-        }
-
-        // The size of the side_info, fixed for layer 3.
-        match header.channel_mode {
-            ChannelMode::Mono => 17,
-            _                 => 32,
         }
     }
     // For MPEG version 2...
@@ -225,22 +223,16 @@ pub(super) fn read_side_info<B: ReadBitsLtr>(
         // Next 1 (1 channel) or 2 (>1 channel) bits are private and should be ignored.
         match header.channel_mode {
             ChannelMode::Mono => bs.ignore_bits(1)?,
-            _                 => bs.ignore_bits(2)?,
-        };
-
-        // The size of the side_info, fixed for layer 3.
-        match header.channel_mode {
-            ChannelMode::Mono =>  9,
-            _                 => 17,
+            _ => bs.ignore_bits(2)?,
         }
-    };
+    }
 
     // Read the side_info for each granule.
     for granule in frame_data.granules_mut(header.version) {
         read_granule_side_info(bs, granule, header)?;
     }
 
-    Ok(side_info_len)
+    Ok(header.side_info_len())
 }
 
 /// Reads the scale factors for a single channel in a granule in a MPEG version 1 audio frame.
@@ -250,7 +242,6 @@ pub(super) fn read_scale_factors_mpeg1<B: ReadBitsLtr>(
     ch: usize,
     frame_data: &mut FrameData,
 ) -> Result<u32> {
-
     let mut bits_read = 0;
 
     let channel = &mut frame_data.granules[gr].channels[ch];
@@ -317,7 +308,6 @@ pub(super) fn read_scale_factors_mpeg1<B: ReadBitsLtr>(
                 bits_read += slen as usize * (end - start);
             }
         }
-
     }
 
     Ok(bits_read as u32)
@@ -329,42 +319,47 @@ pub(super) fn read_scale_factors_mpeg2<B: ReadBitsLtr>(
     is_intensity_stereo: bool,
     channel: &mut GranuleChannel,
 ) -> Result<u32> {
-
     let mut bits_read = 0;
 
     let block_index = match channel.block_type {
-        BlockType::Short{ is_mixed: true  } => 2,
-        BlockType::Short{ is_mixed: false } => 1,
-        _                                   => 0,
+        BlockType::Short { is_mixed: true } => 2,
+        BlockType::Short { is_mixed: false } => 1,
+        _ => 0,
     };
 
     let (slen_table, nsfb_table) = if is_intensity_stereo {
         // The actual value of scalefac_compress is a 9-bit unsigned integer (0..512) for MPEG2. A
-        // left shift reduces it to an 8-bit value (0..255).
+        // left shift reduces it to an 8-bit value (0..256).
         let sfc = u32::from(channel.scalefac_compress) >> 1;
 
         match sfc {
-            0..=179   => ([
-                (sfc / 36),
-                (sfc % 36) / 6,
-                (sfc % 36) % 6,
-                0,
-            ],
-            &SCALE_FACTOR_MPEG2_NSFB[0][block_index]),
-            180..=243 => ([
-                ((sfc - 180) % 64) >> 4,
-                ((sfc - 180) % 16) >> 2,
-                ((sfc - 180) %  4),
-                0,
-            ],
-            &SCALE_FACTOR_MPEG2_NSFB[1][block_index]),
-            244..=255 => ([
-                (sfc - 244) / 3,
-                (sfc - 244) % 3,
-                0,
-                0,
-            ],
-            &SCALE_FACTOR_MPEG2_NSFB[2][block_index]),
+            0..=179 => (
+                [
+                    (sfc / 36),     //
+                    (sfc % 36) / 6, //
+                    (sfc % 36) % 6, //
+                    0,              //
+                ],
+                &SCALE_FACTOR_MPEG2_NSFB[0][block_index],
+            ),
+            180..=243 => (
+                [
+                    ((sfc - 180) % 64) >> 4, //
+                    ((sfc - 180) % 16) >> 2, //
+                    ((sfc - 180) % 4),       //
+                    0,                       //
+                ],
+                &SCALE_FACTOR_MPEG2_NSFB[1][block_index],
+            ),
+            244..=255 => (
+                [
+                    (sfc - 244) / 3, //
+                    (sfc - 244) % 3, //
+                    0,               //
+                    0,               //
+                ],
+                &SCALE_FACTOR_MPEG2_NSFB[2][block_index],
+            ),
             _ => unreachable!(),
         }
     }
@@ -372,28 +367,38 @@ pub(super) fn read_scale_factors_mpeg2<B: ReadBitsLtr>(
         // The actual value of scalefac_compress is a 9-bit unsigned integer (0..512) for MPEG2.
         let sfc = u32::from(channel.scalefac_compress);
 
+        // Preflag is set only if scalefac_compress >= 500 and this is not the intensity stereo
+        // channel. See ISO/IEC 13818-3 section 2.4.3.4.
+        channel.preflag = sfc >= 500;
+
         match sfc {
-            0..=399   => ([
-                (sfc >> 4) / 5,
-                (sfc >> 4) % 5,
-                (sfc % 16) >> 2,
-                (sfc %  4),
-            ],
-            &SCALE_FACTOR_MPEG2_NSFB[3][block_index]),
-            400..=499 => ([
-                ((sfc - 400) >> 2) / 5,
-                ((sfc - 400) >> 2) % 5,
-                (sfc - 400) % 4,
-                0,
-            ],
-            &SCALE_FACTOR_MPEG2_NSFB[4][block_index]),
-            500..=512 => ([
-                (sfc - 500) / 3,
-                (sfc - 500) % 3,
-                0,
-                0,
-            ],
-            &SCALE_FACTOR_MPEG2_NSFB[5][block_index]),
+            0..=399 => (
+                [
+                    (sfc >> 4) / 5,  //
+                    (sfc >> 4) % 5,  //
+                    (sfc % 16) >> 2, //
+                    (sfc % 4),       //
+                ],
+                &SCALE_FACTOR_MPEG2_NSFB[3][block_index],
+            ),
+            400..=499 => (
+                [
+                    ((sfc - 400) >> 2) / 5, //
+                    ((sfc - 400) >> 2) % 5, //
+                    (sfc - 400) % 4,        //
+                    0,                      //
+                ],
+                &SCALE_FACTOR_MPEG2_NSFB[4][block_index],
+            ),
+            500..=512 => (
+                [
+                    (sfc - 500) / 3, //
+                    (sfc - 500) % 3, //
+                    0,               //
+                    0,               //
+                ],
+                &SCALE_FACTOR_MPEG2_NSFB[5][block_index],
+            ),
             _ => unreachable!(),
         }
     };

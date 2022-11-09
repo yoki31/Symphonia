@@ -1,12 +1,12 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use symphonia_core::codecs::{CODEC_TYPE_ALAC, CodecParameters};
-use symphonia_core::errors::{Result, decode_error, unsupported_error};
+use symphonia_core::codecs::{CodecParameters, CODEC_TYPE_ALAC};
+use symphonia_core::errors::{decode_error, unsupported_error, Result};
 use symphonia_core::io::ReadBytes;
 
 use crate::atoms::{Atom, AtomHeader};
@@ -48,16 +48,12 @@ impl Atom for AlacAtom {
         // Read the magic cookie.
         let extra_data = reader.read_boxed_slice_exact(magic_len)?;
 
-        Ok(AlacAtom {
-            header,
-            extra_data,
-        })
+        Ok(AlacAtom { header, extra_data })
     }
 }
 
 impl AlacAtom {
     pub fn fill_codec_params(&self, codec_params: &mut CodecParameters) {
-        codec_params.for_codec(CODEC_TYPE_ALAC)
-                    .with_extra_data(self.extra_data.clone());
+        codec_params.for_codec(CODEC_TYPE_ALAC).with_extra_data(self.extra_data.clone());
     }
 }

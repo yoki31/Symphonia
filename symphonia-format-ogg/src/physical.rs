@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Seek, SeekFrom};
 
 use symphonia_core::errors::Result;
-use symphonia_core::io::{MediaSourceStream, ReadBytes, ScopedStream};
+use symphonia_core::io::{MediaSourceStream, ReadBytes, ScopedStream, SeekBuffered};
 
 use super::logical::{InspectState, LogicalStream};
 use super::page::*;
@@ -22,9 +22,6 @@ pub fn probe_stream_start(
 ) {
     // Save the original position to jump back to.
     let original_pos = reader.pos();
-
-    // Ensure the reader has a sufficient seekback buffer.
-    reader.ensure_seekback_buffer(OGG_PAGE_MAX_SIZE);
 
     // Scope the reader the prevent overruning the seekback region.
     let mut scoped_reader = ScopedStream::new(reader, OGG_PAGE_MAX_SIZE as u64);
@@ -65,7 +62,7 @@ pub fn probe_stream_start(
         };
     }
 
-    debug_assert!(scoped_reader.inner_mut().seek_buffered(original_pos) == original_pos);
+    scoped_reader.into_inner().seek_buffered(original_pos);
 }
 
 pub fn probe_stream_end(
@@ -150,7 +147,6 @@ fn scan_stream_end(
     streams: &mut BTreeMap<u32, LogicalStream>,
     byte_range_end: u64,
 ) -> Option<u64> {
-
     let scoped_len = byte_range_end - reader.pos();
 
     let mut scoped_reader = ScopedStream::new(reader, scoped_len);

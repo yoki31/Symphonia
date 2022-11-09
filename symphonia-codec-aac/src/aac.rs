@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // Previous Author: Kostya Shishkov <kostya.shiskov@gmail.com>
 //
@@ -14,14 +14,14 @@
 use std::f32::consts;
 use std::fmt;
 
-use symphonia_core::errors::{decode_error, unsupported_error, Result};
-use symphonia_core::io::{ReadBitsLtr, FiniteBitStream, BitReaderLtr};
-use symphonia_core::io::vlc::{Codebook, Entry16x16};
-use symphonia_core::audio::{AudioBuffer, AudioBufferRef, AsAudioBufferRef, Signal, SignalSpec};
-use symphonia_core::codecs::{CODEC_TYPE_AAC, CodecParameters, CodecDescriptor};
+use symphonia_core::audio::{AsAudioBufferRef, AudioBuffer, AudioBufferRef, Signal, SignalSpec};
+use symphonia_core::codecs::{CodecDescriptor, CodecParameters, CODEC_TYPE_AAC};
 use symphonia_core::codecs::{Decoder, DecoderOptions, FinalizeResult};
 use symphonia_core::dsp::mdct::Imdct;
+use symphonia_core::errors::{decode_error, unsupported_error, Result};
 use symphonia_core::formats::Packet;
+use symphonia_core::io::vlc::{Codebook, Entry16x16};
+use symphonia_core::io::{BitReaderLtr, FiniteBitStream, ReadBitsLtr};
 use symphonia_core::support_codec;
 use symphonia_core::units::Duration;
 
@@ -41,6 +41,25 @@ macro_rules! validate {
     };
 }
 
+/// A Linear Congruential Generator (LCG) pseudo-random number generator from Numerical Recipes.
+#[derive(Clone)]
+struct Lcg {
+    state: u32,
+}
+
+impl Lcg {
+    fn new(state: u32) -> Self {
+        Lcg { state }
+    }
+
+    #[inline(always)]
+    fn next(&mut self) -> i32 {
+        // Numerical Recipes LCG parameters.
+        self.state = (self.state as u32).wrapping_mul(1664525).wrapping_add(1013904223);
+        self.state as i32
+    }
+}
+
 lazy_static! {
     /// Pre-computed table of y = x^(4/3).
     static ref POW43_TABLE: [f32; 8192] = {
@@ -51,7 +70,6 @@ lazy_static! {
         pow43
     };
 }
-
 
 impl fmt::Display for M4AType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -91,7 +109,8 @@ impl M4AInfo {
 
         if otypeidx >= M4A_TYPES.len() {
             Ok(M4AType::Unknown)
-        } else {
+        }
+        else {
             Ok(M4A_TYPES[otypeidx])
         }
     }
@@ -487,12 +506,7 @@ impl PulseData {
             pulse_offset[i] = bs.read_bits_leq32(5)? as u8;
             pulse_amp[i] = bs.read_bits_leq32(4)? as u8;
         }
-        Ok(Some(Self {
-            number_pulse,
-            pulse_start_sfb,
-            pulse_offset,
-            pulse_amp,
-        }))
+        Ok(Some(Self { number_pulse, pulse_start_sfb, pulse_offset, pulse_amp }))
     }
 }
 
@@ -505,20 +519,14 @@ struct TNSCoeffs {
     length: usize,
     order: usize,
     direction: bool,
-    compress: bool,
     coef: [f32; TNS_MAX_ORDER + 1],
 }
 
 impl TNSCoeffs {
     fn new() -> Self {
-        Self {
-            length: 0,
-            order: 0,
-            direction: false,
-            compress: false,
-            coef: [0.0; TNS_MAX_ORDER + 1],
-        }
+        Self { length: 0, order: 0, direction: false, coef: [0.0; TNS_MAX_ORDER + 1] }
     }
+
     fn read<B: ReadBitsLtr>(
         &mut self,
         bs: &mut B,
@@ -528,28 +536,37 @@ impl TNSCoeffs {
     ) -> Result<()> {
         self.length = bs.read_bits_leq32(if long_win { 6 } else { 4 })? as usize;
         self.order = bs.read_bits_leq32(if long_win { 5 } else { 3 })? as usize;
+
         validate!(self.order <= max_order);
+
         if self.order > 0 {
             self.direction = bs.read_bool()?;
-            self.compress = bs.read_bool()?;
-            let mut coef_bits = 3;
-            if coef_res {
-                coef_bits += 1;
-            }
-            if self.compress {
-                coef_bits -= 1;
-            }
-            let sign_mask = 1 << (coef_bits - 1);
-            let neg_mask = !(2 * sign_mask - 1);
 
-            let fac_base = if coef_res { 1 << 3 } else { 1 << 2 } as f32;
-            let iqfac = (fac_base - 0.5) / (consts::PI / 2.0);
-            let iqfac_m = (fac_base + 0.5) / (consts::PI / 2.0);
+            let coef_compress = bs.read_bool()?;
+
+            // If coef_res is true, then the transmitted resolution of the filter coefficients
+            // is 4 bits, otherwise it's 3 (4.6.9.2).
+            let mut coef_res_bits = if coef_res { 4 } else { 3 };
+
+            // If true, the most significant bit of the filter coefficient is not transmitted
+            // (4.6.9.2).
+            if coef_compress {
+                coef_res_bits -= 1;
+            }
+
+            let sign_mask = 1 << (coef_res_bits - 1);
+            let neg_mask = !((1 << coef_res_bits) - 1);
+
+            // Derived from `1 << (coef_res_bits - 1)` before compression.
+            let fac_base = if coef_res { 8.0 } else { 4.0 };
+
+            let iqfac = (fac_base - 0.5) / consts::FRAC_PI_2;
+            let iqfac_m = (fac_base + 0.5) / consts::FRAC_PI_2;
 
             let mut tmp: [f32; TNS_MAX_ORDER] = [0.0; TNS_MAX_ORDER];
 
-            for el in tmp.iter_mut().take(self.order) {
-                let val = bs.read_bits_leq32(coef_bits)? as u8;
+            for el in tmp[..self.order].iter_mut() {
+                let val = bs.read_bits_leq32(coef_res_bits)? as u8;
 
                 // Convert to signed integer.
                 let c = f32::from(if (val & sign_mask) != 0 {
@@ -564,10 +581,12 @@ impl TNSCoeffs {
 
             // Generate LPC coefficients
             let mut b: [f32; TNS_MAX_ORDER + 1] = [0.0; TNS_MAX_ORDER + 1];
+
             for m in 1..=self.order {
                 for i in 1..m {
                     b[i] = self.coef[i - 1] + tmp[m - 1] * self.coef[m - i - 1];
                 }
+
                 self.coef[..(m - 1)].copy_from_slice(&b[1..m]);
                 self.coef[m - 1] = tmp[m - 1];
             }
@@ -575,14 +594,12 @@ impl TNSCoeffs {
 
         Ok(())
     }
-
 }
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
 struct TNSData {
     n_filt: [usize; MAX_WINDOWS],
-    coef_res: [bool; MAX_WINDOWS],
     coeffs: [[TNSCoeffs; 4]; MAX_WINDOWS],
 }
 
@@ -594,26 +611,25 @@ impl TNSData {
         max_order: usize,
     ) -> Result<Option<Self>> {
         let tns_data_present = bs.read_bool()?;
+
         if !tns_data_present {
             return Ok(None);
         }
+
         let mut n_filt: [usize; MAX_WINDOWS] = [0; MAX_WINDOWS];
-        let mut coef_res: [bool; MAX_WINDOWS] = [false; MAX_WINDOWS];
         let mut coeffs: [[TNSCoeffs; 4]; MAX_WINDOWS] = [[TNSCoeffs::new(); 4]; MAX_WINDOWS];
+
         for w in 0..num_windows {
             n_filt[w] = bs.read_bits_leq32(if long_win { 2 } else { 1 })? as usize;
-            if n_filt[w] != 0 {
-                coef_res[w] = bs.read_bool()?;
-            }
+
+            let coef_res = if n_filt[w] != 0 { bs.read_bool()? } else { false };
+
             for filt in 0..n_filt[w] {
-                coeffs[w][filt].read(bs, long_win, coef_res[w], max_order)?;
+                coeffs[w][filt].read(bs, long_win, coef_res, max_order)?;
             }
         }
-        Ok(Some(Self {
-            n_filt,
-            coef_res,
-            coeffs,
-        }))
+
+        Ok(Some(Self { n_filt, coeffs }))
     }
 }
 
@@ -662,7 +678,6 @@ struct Ics {
     sbinfo: GASubbandInfo,
     coeffs: [f32; 1024],
     delay: [f32; 1024],
-    lcg: Lcg,
 }
 
 const INTENSITY_SCALE_MIN: i16 = -155;
@@ -676,7 +691,7 @@ fn get_scale(scale: i16) -> f32 {
 
 #[inline(always)]
 fn get_intensity_scale(scale: i16) -> f32 {
-    2.0f32.powf(0.25 * f32::from(scale))
+    0.5f32.powf(0.25 * f32::from(scale))
 }
 
 impl Ics {
@@ -695,7 +710,6 @@ impl Ics {
             sbinfo,
             coeffs: [0.0; 1024],
             delay: [0.0; 1024],
-            lcg: Lcg::new(0x1bad1dea),
         }
     }
 
@@ -704,10 +718,7 @@ impl Ics {
         self.delay = [0.0; 1024];
     }
 
-    fn decode_section_data<B: ReadBitsLtr>(
-        &mut self,
-        bs: &mut B
-    ) -> Result<()> {
+    fn decode_section_data<B: ReadBitsLtr>(&mut self, bs: &mut B) -> Result<()> {
         let sect_bits = if self.info.long_win { 5 } else { 3 };
         let sect_esc_val = (1 << sect_bits) - 1;
 
@@ -778,7 +789,6 @@ impl Ics {
 
         for g in 0..self.info.window_groups {
             for sfb in 0..self.info.max_sfb {
-
                 self.scales[g][sfb] = if self.is_zero(g, sfb) {
                     0.0
                 }
@@ -809,11 +819,10 @@ impl Ics {
                 }
                 else {
                     scf_normal += i16::from(bs.read_codebook(scf_table)?.0) - 60;
-                    validate!((scf_normal >= 0) && (scf_normal < 255));
+                    validate!((scf_normal >= 0) && (scf_normal < 256));
 
                     get_scale(scf_normal - 100)
                 }
-
             }
         }
         Ok(())
@@ -837,7 +846,7 @@ impl Ics {
         }
     }
 
-    fn decode_spectrum<B: ReadBitsLtr>(&mut self, bs: &mut B) -> Result<()> {
+    fn decode_spectrum<B: ReadBitsLtr>(&mut self, bs: &mut B, lcg: &mut Lcg) -> Result<()> {
         // Zero all spectral coefficients.
         self.coeffs = [0.0; 1024];
         for g in 0..self.info.window_groups {
@@ -854,7 +863,7 @@ impl Ics {
 
                     match cb_idx {
                         ZERO_HCB => (),
-                        NOISE_HCB => decode_spectrum_noise(&mut self.lcg, scale, dst),
+                        NOISE_HCB => decode_noise(lcg, scale, dst),
                         INTENSITY_HCB | INTENSITY_HCB2 => (),
                         _ => {
                             let unsigned = AAC_UNSIGNED_CODEBOOK[(cb_idx - 1) as usize];
@@ -925,8 +934,9 @@ impl Ics {
     fn decode_ics<B: ReadBitsLtr>(
         &mut self,
         bs: &mut B,
+        lcg: &mut Lcg,
         m4atype: M4AType,
-        common_window: bool
+        common_window: bool,
     ) -> Result<()> {
         self.global_gain = bs.read_bits_leq32(8)? as u8;
 
@@ -963,7 +973,7 @@ impl Ics {
             }
         }
 
-        self.decode_spectrum(bs)?;
+        self.decode_spectrum(bs, lcg)?;
         Ok(())
     }
 
@@ -971,7 +981,6 @@ impl Ics {
         self.place_pulses();
 
         if let Some(ref tns_data) = self.tns_data {
-
             let tns_max_bands = (if self.info.long_win {
                 TNS_MAX_LONG_BANDS[srate_idx]
             }
@@ -999,8 +1008,8 @@ impl Ics {
                         continue;
                     }
 
-                    let start = w * 128 + self.get_band_start(tns_max_bands.min(bottom));
-                    let end = w * 128 + self.get_band_start(tns_max_bands.min(top));
+                    let start = w * 128 + self.get_band_start(bottom.min(tns_max_bands));
+                    let end = w * 128 + self.get_band_start(top.min(tns_max_bands));
                     let lpc = &tns_data.coeffs[w][f].coef;
 
                     if !tns_data.coeffs[w][f].direction {
@@ -1032,24 +1041,7 @@ impl Ics {
     }
 }
 
-#[derive(Clone)]
-struct Lcg {
-    state: u32,
-}
-
-impl Lcg {
-    fn new(state: u32) -> Self {
-        Lcg { state }
-    }
-
-    #[inline(always)]
-    fn next(&mut self) -> i32 {
-        // Numerical Recipes LCG parameters.
-        self.state = (self.state as u32).wrapping_mul(1664525).wrapping_add(1013904223);
-        self.state as i32
-    }
-}
-
+#[inline(always)]
 fn iquant(val: f32) -> f32 {
     if val < 0.0 {
         -((-val).powf(4.0 / 3.0))
@@ -1059,6 +1051,7 @@ fn iquant(val: f32) -> f32 {
     }
 }
 
+#[inline(always)]
 fn requant(val: f32, scale: f32) -> f32 {
     if scale == 0.0 {
         return 0.0;
@@ -1072,7 +1065,8 @@ fn requant(val: f32, scale: f32) -> f32 {
     }
 }
 
-fn decode_spectrum_noise(lcg: &mut Lcg, sf: f32, dst: &mut [f32]) {
+/// Perceptual noise substitution decode step. Section 4.6.13.3.
+fn decode_noise(lcg: &mut Lcg, sf: f32, dst: &mut [f32]) {
     let mut energy = 0.0;
 
     for spec in dst.iter_mut() {
@@ -1096,7 +1090,6 @@ fn decode_quads<B: ReadBitsLtr>(
     scale: f32,
     dst: &mut [f32],
 ) -> Result<()> {
-
     let pow43_table: &[f32; 8192] = &POW43_TABLE;
 
     for out in dst.chunks_mut(4) {
@@ -1138,7 +1131,6 @@ fn decode_pairs<B: ReadBitsLtr>(
     scale: f32,
     dst: &mut [f32],
 ) -> Result<()> {
-
     let pow43_table: &[f32; 8192] = &POW43_TABLE;
 
     for out in dst.chunks_mut(2) {
@@ -1162,10 +1154,10 @@ fn decode_pairs<B: ReadBitsLtr>(
 
         if escape {
             if (x == 16) || (x == -16) {
-                x = read_escape(bs, x > 0)?;
+                x = read_escape(bs, x.is_positive())?;
             }
             if (y == 16) || (y == -16) {
-                y = read_escape(bs, y > 0)?;
+                y = read_escape(bs, y.is_positive())?;
             }
         }
 
@@ -1195,11 +1187,11 @@ fn read_escape<B: ReadBitsLtr>(bs: &mut B, is_pos: bool) -> Result<i16> {
 struct ChannelPair {
     is_pair: bool,
     channel: usize,
-    common_window: bool,
     ms_mask_present: u8,
     ms_used: [[bool; MAX_SFBS]; MAX_WINDOWS],
     ics0: Ics,
     ics1: Ics,
+    lcg: Lcg,
 }
 
 impl ChannelPair {
@@ -1207,11 +1199,11 @@ impl ChannelPair {
         Self {
             is_pair,
             channel,
-            common_window: false,
             ms_mask_present: 0,
             ms_used: [[false; MAX_SFBS]; MAX_WINDOWS],
             ics0: Ics::new(sbinfo),
             ics1: Ics::new(sbinfo),
+            lcg: Lcg::new(0x1f2e3d4c), // Use the same seed as ffmpeg for symphonia-check.
         }
     }
 
@@ -1221,13 +1213,12 @@ impl ChannelPair {
     }
 
     fn decode_ga_sce<B: ReadBitsLtr>(&mut self, bs: &mut B, m4atype: M4AType) -> Result<()> {
-        self.ics0.decode_ics(bs, m4atype, false)?;
+        self.ics0.decode_ics(bs, &mut self.lcg, m4atype, false)?;
         Ok(())
     }
 
     fn decode_ga_cpe<B: ReadBitsLtr>(&mut self, bs: &mut B, m4atype: M4AType) -> Result<()> {
         let common_window = bs.read_bool()?;
-        self.common_window = common_window;
 
         if common_window {
             self.ics0.info.decode_ics_info(bs)?;
@@ -1236,7 +1227,7 @@ impl ChannelPair {
             self.ms_mask_present = bs.read_bits_leq32(2)? as u8;
 
             match self.ms_mask_present {
-                0 => (),
+                0 | 2 => (),
                 1 => {
                     for g in 0..self.ics0.info.window_groups {
                         for sfb in 0..self.ics0.info.max_sfb {
@@ -1244,28 +1235,21 @@ impl ChannelPair {
                         }
                     }
                 }
-                2 => {
-                    for g in 0..self.ics0.info.window_groups {
-                        for sfb in 0..self.ics0.info.max_sfb {
-                            self.ms_used[g][sfb] = true;
-                        }
-                    }
-                }
                 3 => return decode_error("aac: invalid mid-side mask"),
-                _ => unreachable!()
+                _ => unreachable!(),
             }
 
             self.ics1.info = self.ics0.info;
         }
 
-        self.ics0.decode_ics(bs, m4atype, common_window)?;
-        self.ics1.decode_ics(bs, m4atype, common_window)?;
+        self.ics0.decode_ics(bs, &mut self.lcg, m4atype, common_window)?;
+        self.ics1.decode_ics(bs, &mut self.lcg, m4atype, common_window)?;
 
         // Joint-stereo decoding
         if common_window && self.ms_mask_present != 0 {
             let mut g = 0;
-            for w in 0..self.ics0.info.num_windows {
 
+            for w in 0..self.ics0.info.num_windows {
                 if w > 0 && !self.ics0.info.scale_factor_grouping[w - 1] {
                     g += 1;
                 }
@@ -1274,16 +1258,14 @@ impl ChannelPair {
                     let start = w * 128 + self.ics0.get_band_start(sfb);
                     let end = w * 128 + self.ics0.get_band_start(sfb + 1);
 
-                    // Intensity stereo
                     if self.ics1.is_intensity(g, sfb) {
-                        // TODO: Invert always false for AAC Scaleable
-                        let invert = (self.ms_mask_present == 1) && self.ms_used[g][sfb];
-                        let dir = self.ics1.get_intensity_dir(g, sfb) ^ invert;
+                        // Intensity stereo
+                        // Section 4.6.8.2.3
+                        let invert = self.ms_mask_present == 1 && self.ms_used[g][sfb];
+                        let dir = if self.ics1.get_intensity_dir(g, sfb) { 1.0 } else { -1.0 };
+                        let factor = if invert { -1.0 } else { 1.0 };
 
-                        let scale = match dir {
-                            true => -self.ics1.scales[g][sfb],
-                            _    =>  self.ics1.scales[g][sfb],
-                        };
+                        let scale = dir * factor * self.ics1.scales[g][sfb];
 
                         let left = &self.ics0.coeffs[start..end];
                         let right = &mut self.ics1.coeffs[start..end];
@@ -1293,17 +1275,11 @@ impl ChannelPair {
                         }
                     }
                     else if self.ics0.is_noise(g, sfb) || self.ics1.is_noise(g, sfb) {
-                        // Perceptual noise substitution
-                        //
-                        // If ms_used is true for the group and band, or ms_mask_present == 2, then
-                        // the noise vector for the band should be correlated (i.e., the same).
-                        if self.ms_mask_present == 2 || self.ms_used[g][sfb] {
-                            self.ics1.coeffs[start..end]
-                                .copy_from_slice(&self.ics0.coeffs[start..end]);
-                        }
+                        // Perceptual noise substitution, do not do joint-stereo decoding.
+                        // Section 4.6.13.3
                     }
                     else if self.ms_mask_present == 2 || self.ms_used[g][sfb] {
-                        // Mid-side stereo
+                        // Mid-side stereo.
                         let mid = &mut self.ics0.coeffs[start..end];
                         let side = &mut self.ics1.coeffs[start..end];
 
@@ -1347,20 +1323,8 @@ impl Dsp {
     fn new() -> Self {
         let mut kbd_long_win: [f32; 1024] = [0.0; 1024];
         let mut kbd_short_win: [f32; 128] = [0.0; 128];
-        generate_window(
-            WindowType::KaiserBessel(4.0),
-            1.0,
-            1024,
-            true,
-            &mut kbd_long_win,
-        );
-        generate_window(
-            WindowType::KaiserBessel(6.0),
-            1.0,
-            128,
-            true,
-            &mut kbd_short_win,
-        );
+        generate_window(WindowType::KaiserBessel(4.0), 1.0, 1024, true, &mut kbd_long_win);
+        generate_window(WindowType::KaiserBessel(6.0), 1.0, 128, true, &mut kbd_short_win);
         let mut sine_long_win: [f32; 1024] = [0.0; 1024];
         let mut sine_short_win: [f32; 128] = [0.0; 128];
         generate_window(WindowType::Sine, 1.0, 1024, true, &mut sine_long_win);
@@ -1371,8 +1335,8 @@ impl Dsp {
             kbd_short_win,
             sine_long_win,
             sine_short_win,
-            imdct_long: Imdct::new(1024),
-            imdct_short: Imdct::new(128),
+            imdct_long: Imdct::new_scaled(1024, 1.0 / 2048.0),
+            imdct_short: Imdct::new_scaled(128, 1.0 / 256.0),
             tmp: [0.0; 2048],
             ew_buf: [0.0; 1152],
         }
@@ -1388,14 +1352,13 @@ impl Dsp {
         prev_window_shape: bool,
         dst: &mut [f32],
     ) {
-
         let (long_win, short_win) = match window_shape {
-            true  => (&self.kbd_long_win , &self.kbd_short_win ),
+            true => (&self.kbd_long_win, &self.kbd_short_win),
             false => (&self.sine_long_win, &self.sine_short_win),
         };
 
         let (prev_long_win, prev_short_win) = match prev_window_shape {
-            true  => (&self.kbd_long_win , &self.kbd_short_win ),
+            true => (&self.kbd_long_win, &self.kbd_short_win),
             false => (&self.sine_long_win, &self.sine_short_win),
         };
 
@@ -1404,11 +1367,11 @@ impl Dsp {
 
         // Inverse MDCT
         if seq != EIGHT_SHORT_SEQUENCE {
-            self.imdct_long.imdct(coeffs, &mut self.tmp, 1.0 / 2048.0);
+            self.imdct_long.imdct(coeffs, &mut self.tmp);
         }
         else {
             for (ain, aout) in coeffs.chunks(128).zip(self.tmp.chunks_mut(256)) {
-                self.imdct_short.imdct(ain, aout, 1.0 / 256.0);
+                self.imdct_short.imdct(ain, aout);
             }
 
             self.ew_buf = [0.0; 1152];
@@ -1416,13 +1379,13 @@ impl Dsp {
             for (w, src) in self.tmp.chunks(256).enumerate() {
                 if w > 0 {
                     for i in 0..128 {
-                        self.ew_buf[w * 128 + i +   0] += src[i +   0] * short_win[i];
+                        self.ew_buf[w * 128 + i + 0] += src[i + 0] * short_win[i];
                         self.ew_buf[w * 128 + i + 128] += src[i + 128] * short_win[127 - i];
                     }
                 }
                 else {
                     for i in 0..128 {
-                        self.ew_buf[i +   0] = src[i +   0] * prev_short_win[i];
+                        self.ew_buf[i + 0] = src[i + 0] * prev_short_win[i];
                         self.ew_buf[i + 128] = src[i + 128] * short_win[127 - i];
                     }
                 }
@@ -1473,7 +1436,8 @@ impl Dsp {
                 }
             }
             LONG_START_SEQUENCE => {
-                delay[..SHORT_WIN_POINT0].copy_from_slice(&self.tmp[1024..(SHORT_WIN_POINT0 + 1024)]);
+                delay[..SHORT_WIN_POINT0]
+                    .copy_from_slice(&self.tmp[1024..(SHORT_WIN_POINT0 + 1024)]);
 
                 for i in SHORT_WIN_POINT0..SHORT_WIN_POINT1 {
                     delay[i] = self.tmp[i + 1024] * short_win[127 - (i - SHORT_WIN_POINT0)];
@@ -1502,18 +1466,15 @@ pub struct AacDecoder {
 }
 
 impl AacDecoder {
-
     fn set_pair(&mut self, pair_no: usize, channel: usize, pair: bool) -> Result<()> {
         if self.pairs.len() <= pair_no {
-            self.pairs
-                .push(ChannelPair::new(pair, channel, self.sbinfo));
+            self.pairs.push(ChannelPair::new(pair, channel, self.sbinfo));
         }
         else {
             validate!(self.pairs[pair_no].channel == channel);
             validate!(self.pairs[pair_no].is_pair == pair);
         }
-        validate!(if pair { channel + 1 }
-            else { channel } < self.m4ainfo.channels);
+        validate!(if pair { channel + 1 } else { channel } < self.m4ainfo.channels);
         Ok(())
     }
 
@@ -1612,7 +1573,7 @@ impl AacDecoder {
         // Choose decode step based on the object type.
         match self.m4ainfo.otype {
             M4AType::Lc => self.decode_ga(&mut bs)?,
-            _           => return unsupported_error("aac: object type"),
+            _ => return unsupported_error("aac: object type"),
         }
 
         Ok(())
@@ -1620,8 +1581,11 @@ impl AacDecoder {
 }
 
 impl Decoder for AacDecoder {
-
     fn try_new(params: &CodecParameters, _: &DecoderOptions) -> Result<Self> {
+        // This decoder only supports AAC.
+        if params.codec != CODEC_TYPE_AAC {
+            return unsupported_error("aac: invalid codec type");
+        }
 
         let mut m4ainfo = M4AInfo::new();
 
@@ -1649,10 +1613,7 @@ impl Decoder for AacDecoder {
             return unsupported_error("aac: aac too complex");
         }
 
-        let spec = SignalSpec::new(
-            m4ainfo.srate,
-            map_channels(m4ainfo.channels as u32).unwrap()
-        );
+        let spec = SignalSpec::new(m4ainfo.srate, map_channels(m4ainfo.channels as u32).unwrap());
 
         let duration = m4ainfo.samples as Duration;
         let srate = m4ainfo.srate;
@@ -1674,9 +1635,7 @@ impl Decoder for AacDecoder {
     }
 
     fn supported_codecs() -> &'static [CodecDescriptor] {
-        &[
-            support_codec!(CODEC_TYPE_AAC, "aac", "Advanced Audio Coding"),
-        ]
+        &[support_codec!(CODEC_TYPE_AAC, "aac", "Advanced Audio Coding")]
     }
 
     fn codec_params(&self) -> &CodecParameters {
@@ -1687,7 +1646,8 @@ impl Decoder for AacDecoder {
         if let Err(e) = self.decode_inner(packet) {
             self.buf.clear();
             Err(e)
-        } else {
+        }
+        else {
             Ok(self.buf.as_audio_buffer_ref())
         }
     }
@@ -1701,9 +1661,8 @@ impl Decoder for AacDecoder {
     }
 }
 
-const AAC_UNSIGNED_CODEBOOK: [bool; 11] = [
-    false, false, true, true, false, false, true, true, true, true, true,
-];
+const AAC_UNSIGNED_CODEBOOK: [bool; 11] =
+    [false, false, true, true, false, false, true, true, true, true, true];
 
 const AAC_CODEBOOK_MODULO: [u16; 7] = [9, 9, 8, 8, 13, 13, 17];
 
@@ -1812,9 +1771,8 @@ const SWB_OFFSET_8K_LONG: [usize; 40 + 1] = [
     1024,
 ];
 
-const SWB_OFFSET_8K_SHORT: [usize; 15 + 1] = [
-    0, 4, 8, 12, 16, 20, 24, 28, 36, 44, 52, 60, 72, 88, 108, 128,
-];
+const SWB_OFFSET_8K_SHORT: [usize; 15 + 1] =
+    [0, 4, 8, 12, 16, 20, 24, 28, 36, 44, 52, 60, 72, 88, 108, 128];
 
 const SWB_OFFSET_16K_LONG: [usize; 43 + 1] = [
     0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 100, 112, 124, 136, 148, 160, 172, 184, 196, 212,
@@ -1822,9 +1780,8 @@ const SWB_OFFSET_16K_LONG: [usize; 43 + 1] = [
     896, 960, 1024,
 ];
 
-const SWB_OFFSET_16K_SHORT: [usize; 15 + 1] = [
-    0, 4, 8, 12, 16, 20, 24, 28, 32, 40, 48, 60, 72, 88, 108, 128,
-];
+const SWB_OFFSET_16K_SHORT: [usize; 15 + 1] =
+    [0, 4, 8, 12, 16, 20, 24, 28, 32, 40, 48, 60, 72, 88, 108, 128];
 
 const SWB_OFFSET_24K_LONG: [usize; 47 + 1] = [
     0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 52, 60, 68, 76, 84, 92, 100, 108, 116, 124, 136,
@@ -1832,9 +1789,8 @@ const SWB_OFFSET_24K_LONG: [usize; 47 + 1] = [
     704, 768, 832, 896, 960, 1024,
 ];
 
-const SWB_OFFSET_24K_SHORT: [usize; 15 + 1] = [
-    0, 4, 8, 12, 16, 20, 24, 28, 36, 44, 52, 64, 76, 92, 108, 128,
-];
+const SWB_OFFSET_24K_SHORT: [usize; 15 + 1] =
+    [0, 4, 8, 12, 16, 20, 24, 28, 36, 44, 52, 64, 76, 92, 108, 128];
 
 const SWB_OFFSET_64K_LONG: [usize; 47 + 1] = [
     0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 64, 72, 80, 88, 100, 112, 124, 140,

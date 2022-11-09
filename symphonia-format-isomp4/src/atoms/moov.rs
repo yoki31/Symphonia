@@ -1,15 +1,17 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use symphonia_core::errors::{Result, decode_error};
+use symphonia_core::errors::{decode_error, Result};
 use symphonia_core::io::ReadBytes;
-use symphonia_core::meta::MetadataLog;
+use symphonia_core::meta::MetadataRevision;
 
-use crate::atoms::{Atom, AtomHeader, AtomIterator, AtomType, MvexAtom, MvhdAtom, TrakAtom, UdtaAtom};
+use crate::atoms::{
+    Atom, AtomHeader, AtomIterator, AtomType, MvexAtom, MvhdAtom, TrakAtom, UdtaAtom,
+};
 
 use log::warn;
 
@@ -29,11 +31,9 @@ pub struct MoovAtom {
 }
 
 impl MoovAtom {
-    /// Consume any metadata, and pushes it onto provided `MetadataLog`.
-    pub fn take_metadata(&mut self, log: &mut MetadataLog) {
-        if let Some(udta) = self.udta.as_mut() {
-            udta.take_metadata(log)
-        }
+    /// If metadata was read, consumes the metadata and returns it.
+    pub fn take_metadata(&mut self) -> Option<MetadataRevision> {
+        self.udta.as_mut().and_then(|udta| udta.take_metadata())
     }
 
     /// Is the movie segmented.
@@ -70,7 +70,7 @@ impl Atom for MoovAtom {
                 AtomType::UserData => {
                     udta = Some(iter.read_atom::<UdtaAtom>()?);
                 }
-                _ => ()
+                _ => (),
             }
         }
 
@@ -90,12 +90,6 @@ impl Atom for MoovAtom {
             }
         }
 
-        Ok(MoovAtom {
-            header,
-            mvhd: mvhd.unwrap(),
-            traks,
-            mvex,
-            udta,
-        })
+        Ok(MoovAtom { header, mvhd: mvhd.unwrap(), traks, mvex, udta })
     }
 }

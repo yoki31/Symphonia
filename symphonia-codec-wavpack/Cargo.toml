@@ -10,7 +10,8 @@ readme = "README.md"
 categories = ["multimedia", "multimedia::audio", "multimedia::encoding"]
 keywords = ["audio", "codec", "decoder", "wavpack"]
 edition = "2018"
+rust-version = "1.53"
 
 [dependencies]
 log = "0.4"
-symphonia-core = { version = "0.4", path = "../symphonia-core" }
+symphonia-core = { version = "0.5", path = "../symphonia-core" }

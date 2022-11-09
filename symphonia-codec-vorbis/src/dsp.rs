@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -7,7 +7,6 @@
 
 use symphonia_core::dsp::mdct::Imdct;
 
-use super::residue::ResidueScratch;
 use super::window::Windows;
 
 pub struct LappingState {
@@ -17,8 +16,6 @@ pub struct LappingState {
 pub struct Dsp {
     /// DSP channels (max. 256 per-spec, but actually limited to 32 by Symphonia).
     pub channels: Vec<DspChannel>,
-    /// Residue scratch-pad.
-    pub residue_scratch: ResidueScratch,
     /// IMDCT for short-blocks.
     pub imdct_short: Imdct,
     /// IMDCT for long-blocks.
@@ -78,13 +75,13 @@ impl DspChannel {
         lap_state: &Option<LappingState>,
         windows: &Windows,
         imdct: &mut Imdct,
-        buf: &mut [f32]
+        buf: &mut [f32],
     ) {
         // Block size of the current block.
         let bs = if block_flag { self.bs1 } else { self.bs0 };
 
         // Perform the inverse MDCT on the audio spectrum.
-        imdct.imdct(&self.floor[..bs / 2], &mut self.imdct[..bs], 1.0);
+        imdct.imdct(&self.floor[..bs / 2], &mut self.imdct[..bs]);
 
         // Overlap-add and windowing with the previous buffer.
         if let Some(lap_state) = &lap_state {
@@ -114,7 +111,8 @@ impl DspChannel {
                     &mut buf[start..],
                     &self.overlap[start..end],
                     &self.imdct[..self.bs0 / 2],
-                    win);
+                    win,
+                );
             }
             else {
                 // The previous block is short and the current block is long.
@@ -126,7 +124,7 @@ impl DspChannel {
                     &mut buf[..self.bs0 / 2],
                     &self.overlap[..self.bs0 / 2],
                     &self.imdct[start..end],
-                    win
+                    win,
                 );
 
                 // Unity samples (no overlap).

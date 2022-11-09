@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -8,17 +8,17 @@
 use std::collections::BTreeMap;
 use std::io::{Seek, SeekFrom};
 
-use symphonia_core::errors::{Error, Result, SeekErrorKind};
 use symphonia_core::errors::{reset_error, seek_error, unsupported_error};
+use symphonia_core::errors::{Error, Result, SeekErrorKind};
 use symphonia_core::formats::prelude::*;
-use symphonia_core::io::{MediaSource, MediaSourceStream, ReadBytes};
+use symphonia_core::io::{MediaSource, MediaSourceStream, ReadBytes, SeekBuffered};
 use symphonia_core::meta::{Metadata, MetadataLog};
 use symphonia_core::probe::{Descriptor, Instantiate, QueryDescriptor};
 use symphonia_core::support_format;
 
 use log::{debug, info, warn};
 
-use super::common::{OggPacket, SideData};
+use super::common::SideData;
 use super::logical::LogicalStream;
 use super::mappings;
 use super::page::*;
@@ -32,6 +32,7 @@ pub struct OggReader {
     tracks: Vec<Track>,
     cues: Vec<Cue>,
     metadata: MetadataLog,
+    options: FormatOptions,
     /// The page reader.
     pages: PageReader,
     /// `LogicalStream` for each serial.
@@ -43,7 +44,6 @@ pub struct OggReader {
 }
 
 impl OggReader {
-
     fn read_page(&mut self) -> Result<()> {
         // Try reading pages until a page is successfully read, or an IO error.
         loop {
@@ -76,7 +76,7 @@ impl OggReader {
         Ok(())
     }
 
-    fn peek_logical_packet(&self) -> Option<&OggPacket> {
+    fn peek_logical_packet(&self) -> Option<&Packet> {
         let page = self.pages.page();
 
         if let Some(stream) = self.streams.get(&page.header.serial) {
@@ -96,7 +96,7 @@ impl OggReader {
         }
     }
 
-    fn next_logical_packet(&mut self) -> Result<OggPacket> {
+    fn next_logical_packet(&mut self) -> Result<Packet> {
         loop {
             let page = self.pages.page();
 
@@ -143,11 +143,7 @@ impl OggReader {
 
                 debug!(
                     "seek: bisect step: page={{ start={}, end={} }} byte_range=[{}..{}], mid={}",
-                    start_ts,
-                    end_ts,
-                    start_byte_pos,
-                    end_byte_pos,
-                    mid_byte_pos,
+                    start_ts, end_ts, start_byte_pos, end_byte_pos, mid_byte_pos,
                 );
 
                 if required_ts < start_ts {
@@ -198,7 +194,7 @@ impl OggReader {
         let actual_ts = loop {
             match self.peek_logical_packet() {
                 Some(packet) => {
-                    if packet.serial == serial && packet.ts + packet.dur >= required_ts {
+                    if packet.track_id() == serial && packet.ts + packet.dur >= required_ts {
                         break packet.ts;
                     }
 
@@ -255,7 +251,8 @@ impl OggReader {
                         header.serial
                     );
 
-                    streams.insert(header.serial, LogicalStream::new(mapper));
+                    let stream = LogicalStream::new(mapper, self.options.enable_gapless);
+                    streams.insert(header.serial, stream);
                 }
             }
 
@@ -307,7 +304,7 @@ impl OggReader {
                     &mut self.pages,
                     &mut streams,
                     byte_range_start,
-                    total_len
+                    total_len,
                 )?;
             }
         }
@@ -341,15 +338,13 @@ impl OggReader {
 
 impl QueryDescriptor for OggReader {
     fn query() -> &'static [Descriptor] {
-        &[
-            support_format!(
-                "ogg",
-                "OGG",
-                &[ "ogg", "ogv", "oga", "ogx", "ogm", "spx", "opus" ],
-                &[ "video/ogg", "audio/ogg", "application/ogg" ],
-                &[ b"OggS" ]
-            ),
-        ]
+        &[support_format!(
+            "ogg",
+            "OGG",
+            &["ogg", "ogv", "oga", "ogx", "ogm", "spx", "opus"],
+            &["video/ogg", "audio/ogg", "application/ogg"],
+            &[b"OggS"]
+        )]
     }
 
     fn score(_context: &[u8]) -> u8 {
@@ -358,8 +353,10 @@ impl QueryDescriptor for OggReader {
 }
 
 impl FormatReader for OggReader {
+    fn try_new(mut source: MediaSourceStream, options: &FormatOptions) -> Result<Self> {
+        // A seekback buffer equal to the maximum OGG page size is required for this reader.
+        source.ensure_seekback_buffer(OGG_PAGE_MAX_SIZE);
 
-    fn try_new(mut source: MediaSourceStream, _options: &FormatOptions) -> Result<Self> {
         let pages = PageReader::try_new(&mut source)?;
 
         if !pages.header().is_first_page {
@@ -372,6 +369,7 @@ impl FormatReader for OggReader {
             cues: Default::default(),
             metadata: Default::default(),
             streams: Default::default(),
+            options: *options,
             pages,
             phys_byte_range_start: 0,
             phys_byte_range_end: None,
@@ -383,17 +381,7 @@ impl FormatReader for OggReader {
     }
 
     fn next_packet(&mut self) -> Result<Packet> {
-        // Get the next packet, and consume it immediately.
-        let ogg_packet = self.next_logical_packet()?;
-
-        let packet = Packet::new_from_boxed_slice(
-            ogg_packet.serial,
-            ogg_packet.ts,
-            ogg_packet.dur,
-            ogg_packet.data
-        );
-
-        Ok(packet)
+        self.next_logical_packet()
     }
 
     fn metadata(&mut self) -> Metadata<'_> {

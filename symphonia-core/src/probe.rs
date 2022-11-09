@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -8,17 +8,17 @@
 //! The `probe` module provides methods and traits to support auto-detection of media formats from
 //! arbitrary media streams.
 
-use crate::errors::{Result, unsupported_error};
+use crate::errors::{unsupported_error, Result};
 use crate::formats::{FormatOptions, FormatReader};
-use crate::io::{ReadBytes, MediaSourceStream};
-use crate::meta::{MetadataReader, MetadataOptions, MetadataLog, Metadata};
+use crate::io::{MediaSourceStream, ReadBytes, SeekBuffered};
+use crate::meta::{Metadata, MetadataLog, MetadataOptions, MetadataReader};
 
-use log::{error, info};
+use log::{debug, error, info};
 
 mod bloom {
 
     fn fnv1a32(value: &[u8; 2]) -> u32 {
-        const INIT:  u32 = 0x811c_9dc5;
+        const INIT: u32 = 0x811c_9dc5;
         const PRIME: u32 = 0x0100_0193;
 
         let mut state = INIT;
@@ -36,9 +36,7 @@ mod bloom {
 
     impl Default for BloomFilter {
         fn default() -> Self {
-            BloomFilter {
-                filter: vec![0; BloomFilter::M >> 6].into_boxed_slice(),
-            }
+            BloomFilter { filter: vec![0; BloomFilter::M >> 6].into_boxed_slice() }
         }
     }
 
@@ -50,7 +48,7 @@ mod bloom {
             let hash = fnv1a32(key);
 
             let h0 = (hash >> 16) as u16;
-            let h1 = (hash >>  0) as u16;
+            let h1 = (hash >> 0) as u16;
 
             let i0 = h0 as usize & (BloomFilter::M - 1);
             let i1 = h0.wrapping_add(h1.wrapping_mul(1)) as usize & (BloomFilter::M - 1);
@@ -65,20 +63,25 @@ mod bloom {
             let hash = fnv1a32(key);
 
             let h0 = (hash >> 16) as u16;
-            let h1 = (hash >>  0) as u16;
+            let h1 = (hash >> 0) as u16;
 
             let i0 = h0 as usize & (BloomFilter::M - 1);
             let i1 = h0.wrapping_add(h1.wrapping_mul(1)) as usize & (BloomFilter::M - 1);
             let i2 = h0.wrapping_add(h1.wrapping_mul(2)) as usize & (BloomFilter::M - 1);
 
-            if ( self.filter[i0 >> 6] & (1 << (i0 & 63)) ) == 0 { return false; }
-            if ( self.filter[i1 >> 6] & (1 << (i1 & 63)) ) == 0 { return false; }
-            if ( self.filter[i2 >> 6] & (1 << (i2 & 63)) ) == 0 { return false; }
+            if (self.filter[i0 >> 6] & (1 << (i0 & 63))) == 0 {
+                return false;
+            }
+            if (self.filter[i1 >> 6] & (1 << (i1 & 63))) == 0 {
+                return false;
+            }
+            if (self.filter[i2 >> 6] & (1 << (i2 & 63))) == 0 {
+                return false;
+            }
 
             true
         }
     }
-
 }
 
 /// `Instantiate` is an enumeration of instantiation functions used by `Descriptor` and `Probe` to
@@ -111,7 +114,7 @@ pub struct Descriptor {
     pub inst: Instantiate,
 }
 
-/// The `Query` trait indicates that the implementer may be registered and capable of
+/// The `QueryDescriptor` trait indicates that the implementer may be registered and capable of
 /// probing.
 pub trait QueryDescriptor {
     /// Returns a list of descriptors.
@@ -129,7 +132,7 @@ pub trait QueryDescriptor {
 /// from a file path, HTTP header, email  attachment metadata, etc. `Hint`s are optional, and won't
 /// lead the probe astray if they're wrong, but they may provide an informed initial guess and
 /// optimize the guessing process siginificantly especially as more formats are registered.
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Hint {
     extension: Option<String>,
     mime_type: Option<String>,
@@ -138,10 +141,7 @@ pub struct Hint {
 impl Hint {
     /// Instantiate an empty `Hint`.
     pub fn new() -> Self {
-        Hint {
-            extension: None,
-            mime_type: None,
-        }
+        Hint { extension: None, mime_type: None }
     }
 
     /// Add a file extension `Hint`.
@@ -191,18 +191,10 @@ pub struct ProbeResult {
 
 /// `Probe` scans a `MediaSourceStream` for metadata and container formats, and provides an
 /// iterator-like interface to instantiate readers for the formats encountered.
+#[derive(Default)]
 pub struct Probe {
     filter: bloom::BloomFilter,
     registered: Vec<Descriptor>,
-}
-
-impl Default for Probe {
-    fn default() -> Self {
-        Probe {
-            filter: Default::default(),
-            registered: Default::default(),
-        }
-    }
 }
 
 impl Probe {
@@ -223,7 +215,7 @@ impl Probe {
 
             match marker.len() {
                 2..=16 => prefix.copy_from_slice(&marker[0..2]),
-                _      => panic!("invalid marker length (only 2-16 bytes supported)."),
+                _ => panic!("invalid marker length (only 2-16 bytes supported)."),
             }
 
             self.filter.insert(&prefix);
@@ -246,8 +238,8 @@ impl Probe {
             count += 1;
 
             if count % 4096 == 0 {
-                info!(
-                    "searching for stream marker... {}+{} / {} bytes.",
+                debug!(
+                    "searching for format marker... {}+{} / {} bytes.",
                     init_pos,
                     count,
                     Probe::PROBE_SEARCH_LIMIT
@@ -263,11 +255,9 @@ impl Probe {
                 context[0..2].copy_from_slice(&win.to_be_bytes()[0..2]);
                 mss.read_buf_exact(&mut context[2..])?;
 
-                info!(
-                    "found a possible stream marker within {:x?} @ {}+{} bytes.",
-                    context,
-                    init_pos,
-                    count,
+                debug!(
+                    "found a possible format marker within {:x?} @ {}+{} bytes.",
+                    context, init_pos, count,
                 );
 
                 // Search for registered markers in the 16-byte window.
@@ -278,18 +268,18 @@ impl Probe {
                         // If a match is found, return the instantiate.
                         if context[0..len] == **marker {
                             // Re-align the stream to the start of the marker.
-                            mss.rewind(16);
+                            mss.seek_buffered_rev(16);
 
                             // TODO: Implement scoring.
 
                             info!(
-                                "found the stream marker {:x?} @ {}+{} bytes.",
+                                "found the format marker {:x?} @ {}+{} bytes.",
                                 &context[0..len],
                                 init_pos,
                                 count,
                             );
 
-                            return Ok(registered.inst)
+                            return Ok(registered.inst);
                         }
                     }
                 }
@@ -297,14 +287,14 @@ impl Probe {
                 // If no registered markers were matched, then the bloom filter returned a false
                 // positive. Re-align the stream to the end of the 2-byte window and continue the
                 // search.
-                mss.rewind(16 - 2);
+                mss.seek_buffered_rev(16 - 2);
             }
         }
 
         // Could not find any marker within the probe limit.
         error!("reached probe limit of {} bytes.", Probe::PROBE_SEARCH_LIMIT);
 
-        unsupported_error("core (probe): no suitable reader found")
+        unsupported_error("core (probe): no suitable format reader found")
     }
 
     /// Searches the provided `MediaSourceStream` for a container format. Any metadata that is read
@@ -317,7 +307,6 @@ impl Probe {
         format_opts: &FormatOptions,
         metadata_opts: &MetadataOptions,
     ) -> Result<ProbeResult> {
-
         let mut metadata: MetadataLog = Default::default();
 
         // Loop over all elements in the stream until a container format is found.
@@ -327,12 +316,8 @@ impl Probe {
                 Instantiate::Format(fmt) => {
                     let format = fmt(mss, format_opts)?;
 
-                    let metadata = if metadata.metadata().current().is_some() {
-                        Some(metadata)
-                    }
-                    else {
-                        None
-                    };
+                    let metadata =
+                        if metadata.metadata().current().is_some() { Some(metadata) } else { None };
 
                     return Ok(ProbeResult { format, metadata: ProbedMetadata { metadata } });
                 }
@@ -342,7 +327,7 @@ impl Probe {
                     let mut reader = meta(metadata_opts);
                     metadata.push(reader.read_all(&mut mss)?);
 
-                    info!("chaining metadata element.");
+                    debug!("chaining a metadata element.");
                 }
             }
         }
@@ -350,7 +335,6 @@ impl Probe {
         // This function returns when either the end-of-stream is reached, an error occurs, or a
         // container format is found.
     }
-
 }
 
 /// Convenience macro for declaring a probe `Descriptor` for a `FormatReader`.
@@ -364,9 +348,7 @@ macro_rules! support_format {
             mime_types: $mimes,
             markers: $markers,
             score: Self::score,
-            inst: Instantiate::Format(|source, opt| {
-                Ok(Box::new(Self::try_new(source, &opt)?))
-            })
+            inst: Instantiate::Format(|source, opt| Ok(Box::new(Self::try_new(source, &opt)?))),
         }
     };
 }
@@ -382,7 +364,7 @@ macro_rules! support_metadata {
             mime_types: $mimes,
             markers: $markers,
             score: Self::score,
-            inst: Instantiate::Metadata(|opt| { Box::new(Self::new(&opt)) })
+            inst: Instantiate::Metadata(|opt| Box::new(Self::new(&opt))),
         }
     };
 }

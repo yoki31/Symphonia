@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -8,9 +8,12 @@
 use std::cmp;
 use std::io;
 
-use super::{ReadBytes, FiniteStream};
+use super::{FiniteStream, ReadBytes};
 
-const UNDERRUN_ERROR_STR: &str = "buffer underrun";
+#[inline(always)]
+fn underrun_error<T>() -> io::Result<T> {
+    Err(io::Error::new(io::ErrorKind::UnexpectedEof, "buffer underrun"))
+}
 
 /// A `BufReader` reads bytes from a byte buffer.
 pub struct BufReader<'a> {
@@ -21,10 +24,7 @@ pub struct BufReader<'a> {
 impl<'a> BufReader<'a> {
     /// Instantiate a new `BufReader` with a given byte buffer.
     pub fn new(buf: &'a [u8]) -> Self {
-        BufReader {
-            buf,
-            pos: 0,
-        }
+        BufReader { buf, pos: 0 }
     }
 
     /// Scans up-to `scan_len` bytes from the stream until a byte pattern is matched. A reference to
@@ -43,7 +43,7 @@ impl<'a> BufReader<'a> {
         &mut self,
         pattern: &[u8],
         align: usize,
-        scan_len: usize
+        scan_len: usize,
     ) -> io::Result<&'a [u8]> {
         // The pattern must be atleast one byte.
         debug_assert!(!pattern.is_empty());
@@ -78,7 +78,7 @@ impl<'a> BufReader<'a> {
     /// Returns a reference to the next `len` bytes in the buffer and advances the stream.
     pub fn read_buf_bytes_ref(&mut self, len: usize) -> io::Result<&'a [u8]> {
         if self.pos + len > self.buf.len() {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, UNDERRUN_ERROR_STR));
+            return underrun_error();
         }
         self.pos += len;
         Ok(&self.buf[self.pos - len..self.pos])
@@ -93,11 +93,10 @@ impl<'a> BufReader<'a> {
 }
 
 impl<'a> ReadBytes for BufReader<'a> {
-
     #[inline(always)]
     fn read_byte(&mut self) -> io::Result<u8> {
         if self.buf.len() - self.pos < 1 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, UNDERRUN_ERROR_STR));
+            return underrun_error();
         }
 
         self.pos += 1;
@@ -107,7 +106,7 @@ impl<'a> ReadBytes for BufReader<'a> {
     #[inline(always)]
     fn read_double_bytes(&mut self) -> io::Result<[u8; 2]> {
         if self.buf.len() - self.pos < 2 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, UNDERRUN_ERROR_STR));
+            return underrun_error();
         }
 
         let mut bytes: [u8; 2] = [0u8; 2];
@@ -120,7 +119,7 @@ impl<'a> ReadBytes for BufReader<'a> {
     #[inline(always)]
     fn read_triple_bytes(&mut self) -> io::Result<[u8; 3]> {
         if self.buf.len() - self.pos < 3 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, UNDERRUN_ERROR_STR));
+            return underrun_error();
         }
 
         let mut bytes: [u8; 3] = [0u8; 3];
@@ -133,7 +132,7 @@ impl<'a> ReadBytes for BufReader<'a> {
     #[inline(always)]
     fn read_quad_bytes(&mut self) -> io::Result<[u8; 4]> {
         if self.buf.len() - self.pos < 4 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, UNDERRUN_ERROR_STR));
+            return underrun_error();
         }
 
         let mut bytes: [u8; 4] = [0u8; 4];
@@ -155,7 +154,7 @@ impl<'a> ReadBytes for BufReader<'a> {
         let len = buf.len();
 
         if self.buf.len() - self.pos < len {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, UNDERRUN_ERROR_STR));
+            return underrun_error();
         }
 
         buf.copy_from_slice(&self.buf[self.pos..self.pos + len]);
@@ -168,7 +167,7 @@ impl<'a> ReadBytes for BufReader<'a> {
         &mut self,
         pattern: &[u8],
         align: usize,
-        buf: &'b mut [u8]
+        buf: &'b mut [u8],
     ) -> io::Result<&'b mut [u8]> {
         let scanned = self.scan_bytes_aligned_ref(pattern, align, buf.len())?;
         buf[..scanned.len()].copy_from_slice(scanned);
@@ -178,7 +177,7 @@ impl<'a> ReadBytes for BufReader<'a> {
 
     fn ignore_bytes(&mut self, count: u64) -> io::Result<()> {
         if self.buf.len() - self.pos < count as usize {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, UNDERRUN_ERROR_STR));
+            return underrun_error();
         }
 
         self.pos += count as usize;

@@ -1,5 +1,5 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -7,7 +7,7 @@
 
 use symphonia_core::errors::Result;
 use symphonia_core::io::ReadBytes;
-use symphonia_core::meta::MetadataLog;
+use symphonia_core::meta::MetadataRevision;
 
 use crate::atoms::{Atom, AtomHeader, AtomIterator, AtomType, MetaAtom};
 
@@ -21,11 +21,9 @@ pub struct UdtaAtom {
 }
 
 impl UdtaAtom {
-    /// Consume any metadata, and push it onto provided `MetadataLog`.
-    pub fn take_metadata(&mut self, log: &mut MetadataLog) {
-        if let Some(meta) = self.meta.take() {
-            meta.take_metadata(log)
-        }
+    /// If metadata was read, consumes the metadata and returns it.
+    pub fn take_metadata(&mut self) -> Option<MetadataRevision> {
+        self.meta.as_mut().and_then(|meta| meta.take_metadata())
     }
 }
 
@@ -37,7 +35,7 @@ impl Atom for UdtaAtom {
     #[allow(clippy::single_match)]
     fn read<B: ReadBytes>(reader: &mut B, header: AtomHeader) -> Result<Self> {
         let mut iter = AtomIterator::new(reader, header);
-        
+
         let mut meta = None;
 
         while let Some(header) = iter.next()? {
@@ -45,13 +43,10 @@ impl Atom for UdtaAtom {
                 AtomType::Meta => {
                     meta = Some(iter.read_atom::<MetaAtom>()?);
                 }
-                _ => ()
+                _ => (),
             }
         }
 
-        Ok(UdtaAtom {
-            header,
-            meta,
-        })
+        Ok(UdtaAtom { header, meta })
     }
 }

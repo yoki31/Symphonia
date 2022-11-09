@@ -1,15 +1,15 @@
 // Symphonia
-// Copyright (c) 2019-2021 The Project Symphonia Developers.
+// Copyright (c) 2019-2022 The Project Symphonia Developers.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use symphonia_core::errors::{Result, decode_error};
+use symphonia_core::errors::{decode_error, Result};
 use symphonia_core::io::ReadBytes;
 
 use crate::atoms::{Atom, AtomHeader, AtomIterator, AtomType};
-use crate::atoms::{StsdAtom, SttsAtom, StscAtom, StszAtom, StcoAtom, Co64Atom};
+use crate::atoms::{Co64Atom, StcoAtom, StscAtom, StsdAtom, StszAtom, SttsAtom};
 
 use log::warn;
 
@@ -69,7 +69,7 @@ impl Atom for StblAtom {
                 AtomType::ChunkOffset64 => {
                     co64 = Some(iter.read_atom::<Co64Atom>()?);
                 }
-                _ => ()
+                _ => (),
             }
         }
 
